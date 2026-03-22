@@ -88,7 +88,10 @@ async def _unified_translate_api(
     text: str,
     target_language: str,
     context_messages: Optional[List[str]] = None,
-    model_override: Optional[str] = None
+    model_override: Optional[str] = None,
+    instruction: Optional[str] = None,
+    server_nicknames: Optional[List[str]] = None,
+    custom_slang: Optional[dict[str, str]] = None
 ) -> tuple[str, str, str, bool, any]:
     """
     언어 감지, 오타 교정, 번역을 한 번의 API 호출로 수행.
@@ -102,15 +105,44 @@ async def _unified_translate_api(
 
     # 추론 모델(gpt-5)인 경우 더 높은 토큰 한도 필요 (생각하는 토큰 포함)
     is_reasoning = "gpt-5" in target_model
-    max_tokens_val = 4000 if is_reasoning else 800
+    max_tokens_val = 16000 if is_reasoning else 4000 # 일반 모델도 4k로 증설
 
+    prompt = ""
     if use_context:
         context_block = "### Recent conversation (for context):\n"
         for i, msg in enumerate(context_messages, 1):
             context_block += f"{i}. {msg}\n"
-        prompt = f"{context_block}\n### Task: Translate the following to {target_language}\n### Content:\n{text}"
-    else:
-        prompt = f"### Task: Translate the following to {target_language}\n### Content:\n{text}"
+        prompt += context_block
+    
+    prompt += f"### Target Language: {target_language}\n"
+    if instruction:
+        prompt += f"### [CRITICAL] Special Instruction: {instruction}\n"
+    
+    if server_nicknames or custom_slang:
+        prompt += "### [CONTEXT] Server Metadata (DO NOT LEAK IN OUTPUT):\n"
+        if server_nicknames:
+            prompt += f"- Official Nicknames: {', '.join(server_nicknames)}\n"
+        if custom_slang:
+            prompt += "- Custom Slang Mappings:\n"
+            for short, full in custom_slang.items():
+                prompt += f"  * '{short}' -> '{full}'\n"
+        prompt += "Rule: Use this metadata for accuracy, but NEVER repeat or translate these metadata headers or lists in the output fields.\n\n"
+
+    # Identity & Slang Rules (Promoted to System Prompt or kept here as specific context)
+    if server_nicknames:
+        prompt += "- **Identity Normalization Rule**: If a word (or its variation like '티캣' for 'teqcat') is used to **address** someone (e.g., 'Jellyfish, come here') or is the subject of a personal action, you **MUST** normalize it to the official string.\n"
+        prompt += "- **Honorific Hint**: Honorifics (e.g., -님, -san) are strong indicators, but their absence does NOT automatically mean it's a common noun. Use natural language context.\n"
+        prompt += "- **Slang/Abbreviations**: Recognize and expand common internet slang (e.g., 'nc' or 'ncnc' means 'nice', 'ㄱㄱ' means 'go go', 'ㅅㄱ' means 'good job / GG'). Normalize these in the `CORRECTED` field and translate them naturally.\n"
+        prompt += "- **Strict Common Noun Priority**: Treat as a common noun ONLY if used in a purely non-personal, literal sense: food (냉채, 무침), nature (sky, sea), weather, or biology (scientific species). (e.g., 'eating jellyfish' -> common noun).\n"
+        prompt += "- **Action**: If it refers to a person's identity, normalize to the official string. Otherwise, translate naturally.\n"
+
+    if custom_slang:
+        prompt += "### Custom Server Slang Mapping (User Defined):\n"
+        for short, full in custom_slang.items():
+            prompt += f"- '{short}': refers to '{full}'\n"
+        prompt += "- **Slang Expansion Rule**: If the text contains these abbreviations, intelligently expand them to their full meaning in `CORRECTED` and `TRANSLATED` if the context fits.\n"
+
+    prompt += f"### Content:\n{text}"
 
     response = await _api_call_with_retry(lambda: client.chat.completions.create(
         model=target_model,
@@ -128,12 +160,17 @@ async def _unified_translate_api(
     # 로그Snippet을 500자로 늘려 전체 파싱 결과 확인
     tlog.info(f"[UNIFIED-API] model={response.model} | in={usage.prompt_tokens} out={usage.completion_tokens} | result={repr(content[:500])}")
 
-    # 응답 파싱 (3개 라인: DETECTED, CORRECTED, TRANSLATED)
-    # 정규표현식을 사용하여 더 유연하게 파싱 (볼드체나 공백 대응)
+    # 응답 파싱 (DETECTED, CORRECTED, TRANSLATED 필드 추출)
     def extract_field(label, text_block):
-        pattern = rf"(?i)(?:\*\*|__)?{label}(?:\*\*|__)?\s*:\s*(.*)"
-        match = re.search(pattern, text_block)
-        return match.group(1).strip() if match else None
+        # 다음 라벨이나 문자열 끝까지 탐욕적으로 수집 (DOTALL 사용)
+        pattern = rf"(?i)(?:\*\*|__)?{label}(?:\*\*|__)?\s*:\s*(.*?)(?=\s*(?:\n(?:\*\*|__)?(?:DETECTED|CORRECTED|TRANSLATED|TEXT)(?:\*\*|__)?\s*:|$))"
+        match = re.search(pattern, text_block, re.DOTALL)
+        if match:
+            res = match.group(1).strip()
+            # AI가 문자열로 \n을 내뱉는 경우 실제 줄바꿈으로 변환
+            res = res.replace("\\n", "\n")
+            return res
+        return None
 
     source_lang = extract_field("DETECTED", content) or "Unknown"
     corrected_text = extract_field("CORRECTED", content) or text
@@ -155,6 +192,84 @@ async def _unified_translate_api(
     was_correction = _is_meaningful_correction(text, corrected_text)
 
     return source_lang, corrected_text, translated_text, was_correction, usage
+
+
+async def _ai_router_judge(text: str, target_language: str) -> tuple[bool, Optional[dict]]:
+    """
+    GPT-4.1 mini를 사용하여 문맥 필요 여부를 1차 판별.
+    필요 없다면 여기서 바로 번역 결과까지 가져옴 (Latency 최적화).
+    """
+    client = _get_client()
+    # 라우팅용 프롬프트: 문맥이 꼭 필요한지 물어보고, 아니면 바로 번역하게 함
+    prompt = f"""# Task: Route and Translate
+Determine if the following text needs previous conversation context to be translated naturally and accurately into {target_language}.
+
+Input: {text}
+
+## Rules:
+1. If context is ABSOLUTELY necessary (e.g., ambiguous pronouns, fragments like "Go", "Right", "Do it"), just output exactly: UPGRADE
+2. If the text is clear enough to translate accurately without context, you MUST provide the translation into {target_language}.
+3. The format MUST be exactly 3 lines:
+DETECTED: <Source Language>
+CORRECTED: <Normalized Source Text>
+TRANSLATED: <Natural Translation in {target_language}>
+
+IMPORTANT: Every character in the TRANSLATED field MUST be in {target_language}.
+NO extra explanations or text."""
+
+    try:
+        response = await _api_call_with_retry(lambda: client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=500,
+            temperature=0.3
+        ))
+        content = response.choices[0].message.content.strip()
+        usage = response.usage
+        
+        # 'UPGRADE'가 포함되어 있고 내용이 짧으면 (오탐 방지) 업그레이드 신호로 간주
+        if "UPGRADE" in content and len(content) < 15:
+            return True, None
+            
+        # 결과 파싱 시도
+        def extract_field(label, text_block):
+            # 다음 라벨이나 문자열 끝까지 탐욕적으로 수집 (DOTALL 사용)
+            pattern = rf"(?i)(?:\*\*|__)?{label}(?:\*\*|__)?\s*:\s*(.*?)(?=\s*(?:\n(?:\*\*|__)?(?:DETECTED|CORRECTED|TRANSLATED|TEXT)(?:\*\*|__)?\s*:|$))"
+            match = re.search(pattern, text_block, re.DOTALL)
+            if match:
+                res = match.group(1).strip()
+                res = res.replace("\\n", "\n")
+                return res
+            return None
+
+        source_lang = extract_field("DETECTED", content) or "Unknown"
+        corrected_text = extract_field("CORRECTED", content) or text
+        translated_text = extract_field("TRANSLATED", content) or ""
+
+        if not translated_text:
+            return True, None # 파싱 실패 시 안전하게 업그레이드
+            
+        # [안전장치] 번역문이 원문과 동일하다면 (번역 실패) 업그레이드
+        if translated_text.strip() == text.strip() and len(text.strip()) > 1:
+            tlog.warning(f"[ROUTER-FALLBACK] Translation identical to source. Upgrading...")
+            return True, None
+
+        was_correction = _is_meaningful_correction(text, corrected_text)
+        
+        return False, {
+            "source_lang": source_lang,
+            "translated": translated_text,
+            "model": OPENAI_MODEL,
+            "cache_hit": False,
+            "was_correction": was_correction,
+            "usage": usage
+        }
+    except Exception as e:
+        tlog.error(f"[ROUTER-ERROR] {e}")
+        return True, None # 에러 발생 시 안전하게 업그레이드 (Fallback)
+
+
+
 
 
 
@@ -237,6 +352,9 @@ async def detect_and_translate(
     nickname: str = "",
     use_cache: bool = True,
     context_messages: list[str] | None = None,
+    instruction: str | None = None,
+    server_nicknames: list[str] | None = None,
+    custom_slang: dict[str, str] | None = None
 ) -> dict:
     """
     전처리(부호 분리) → 캐시 → 오타 → 감지 → 번역 → 후처리(부호 복원)
@@ -246,7 +364,8 @@ async def detect_and_translate(
     ai_input_text = build_ai_input(clean_text, semantic_mark)
 
     # ── 2. 캐시 확인 ──
-    if use_cache:
+    # 커스텀 지시사항이나 닉네임 목록, 커스텀 줄임말이 있는 경우 캐시 무시
+    if use_cache and not instruction and not server_nicknames and not custom_slang:
         cached = await get_cached(ai_input_text, target_language)
         if cached:
             restored = restore_punctuation(cached["translated"], semantic_mark, emphasis_raw)
@@ -259,37 +378,62 @@ async def detect_and_translate(
                 "was_correction": False,
             }
 
-    # ── 3. 하이브리드 모델 선택 ──
-    # 기본적으로 비용이 저렴하고 빠른 gpt-4.1-mini를 사용합니다.
-    # 문맥 파악이 매우 중요한 경우에만 gpt-5-mini(추론형)를 선택합니다.
-    
-    use_reasoning_model = False
-    reason = "simple"
-    
-    if context_messages and _needs_context(clean_text):
-        use_reasoning_model = True
-        reason = "context"
-    elif _is_complex_text(clean_text):
-        use_reasoning_model = True
-        reason = "complexity"
-        
-    # 기본 성능이 충분하므로 슬랭/오타/긴 문장도 4.1-mini가 처리
-    # 말장난이나 고난도 텍스트는 플래그십 gpt-5(smart)를 사용하여 품질 극대화
-    if reason == "complexity":
-        target_model = OPENAI_MODEL_SMART
-    elif reason == "context":
-        target_model = OPENAI_REASONING_MODEL
-    else:
-        target_model = OPENAI_MODEL
+    # ── 3. 스마트 라우팅 (AI 기반) ──
+    # 3-1. 긴 문장이나 이미 충분히 복잡한 경우 (Heuristic) -> 바로 각자 전담 모델로
+    # 3-2. 짧고 모호한 경우 -> GPT-4.1 mini가 1차 판단 (Router)
 
-    tlog.info(f"[MODEL-SELECT] choice={target_model} | reason={reason} | text={repr(clean_text[:60])}")
+    use_reasoning_model = False
+    target_model = OPENAI_MODEL
+    router_result = None
+
+    # 문량이 길거나(30자 초과) 언어적 난도가 높은 경우(말장난 등)는 바로 처리
+    # [FIX] 커스텀 지시사항(instruction)이나 닉네임 정보가 있는 경우 라우터를 건너뜀
+    if instruction or server_nicknames or custom_slang or len(clean_text) > 30 or _is_complex_text(clean_text):
+        target_model = OPENAI_MODEL_SMART if _is_complex_text(clean_text) else OPENAI_MODEL
+        tlog.info(f"[ROUTING] Direct Path (inst={bool(instruction)}, nick={bool(server_nicknames)}) -> model={target_model}")
+    else:
+        # 짧은 문장은 AI가 판단하여 업그레이드 여부 결정
+        should_upgrade, result = await _ai_router_judge(ai_input_text, target_language)
+        if not should_upgrade and result:
+            router_result = result
+            tlog.info(f"[ROUTING] Router Path -> Success with Fast Model")
+        else:
+            use_reasoning_model = True
+            target_model = OPENAI_REASONING_MODEL # 맥락 필요 시 gpt-5-mini
+            tlog.info(f"[ROUTING] Router Path -> UPGRADE to {target_model}")
+
+    # 1차 판단(Router)에서 이미 번역이 완료된 경우 처리
+    if router_result:
+        # 사용량 기록
+        if router_result.get("usage") and user_id:
+            u = router_result["usage"]
+            await record_usage(
+                user_id, nickname, router_result["model"],
+                u.prompt_tokens, u.completion_tokens,
+                was_correction=router_result["was_correction"]
+            )
+        
+        final_translated = restore_punctuation(router_result["translated"], semantic_mark, emphasis_raw)
+        if use_cache:
+            await set_cached(ai_input_text, target_language, router_result["source_lang"], router_result["translated"], user_id=str(user_id))
+        
+        return {
+            "source_lang": router_result["source_lang"],
+            "translated": final_translated,
+            "model": router_result["model"],
+            "cache_hit": False,
+            "was_correction": router_result["was_correction"],
+        }
 
     # 통합 API 호출
     source_lang, corrected_text, translated, was_correction, usage = await _unified_translate_api(
         ai_input_text,
         target_language,
         context_messages=context_messages if use_reasoning_model else None,
-        model_override=target_model
+        model_override=target_model,
+        instruction=instruction,
+        server_nicknames=server_nicknames,
+        custom_slang=custom_slang
     )
 
     # ── 4. 사용량 기록 ──
@@ -305,7 +449,7 @@ async def detect_and_translate(
 
     # ── 6. 캐시 저장 ──
     if use_cache:
-        await set_cached(ai_input_text, target_language, source_lang, translated)
+        await set_cached(ai_input_text, target_language, source_lang, translated, user_id=str(user_id))
     return {
         "source_lang": source_lang,
         "translated": final_translated,
@@ -335,7 +479,8 @@ async def translate_image(
 
     # 추론형 모델(gpt-5) 대응
     is_reasoning = "gpt-5" in target_model
-    max_tokens_val = 4000 if is_reasoning else 1000
+    # 추론 모델은 생각(Thinking) 토큰이 포함되므로 훨씬 넉넉하게 잡아야 함
+    max_tokens_val = 24000 if is_reasoning else 4000
 
     response = await _api_call_with_retry(lambda: client.chat.completions.create(
         model=target_model,
@@ -362,9 +507,14 @@ async def translate_image(
 
     # 응답 파싱
     def extract_field(label, text_block):
-        pattern = rf"(?i)(?:\*\*|__)?{label}(?:\*\*|__)?\s*:\s*(.*)"
-        match = re.search(pattern, text_block)
-        return match.group(1).strip() if match else None
+        # 다음 라벨이나 문자열 끝까지 탐욕적으로 수집 (DOTALL 사용)
+        pattern = rf"(?i)(?:\*\*|__)?{label}(?:\*\*|__)?\s*:\s*(.*?)(?=\s*(?:\n(?:\*\*|__)?(?:DETECTED|CORRECTED|TRANSLATED|TEXT)(?:\*\*|__)?\s*:|$))"
+        match = re.search(pattern, text_block, re.DOTALL)
+        if match:
+            res = match.group(1).strip()
+            res = res.replace("\\n", "\n")
+            return res
+        return None
 
     source_lang = extract_field("DETECTED", content) or "Unknown"
     original_text = extract_field("TEXT", content) or "(No text extracted)"

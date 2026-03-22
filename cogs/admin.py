@@ -32,8 +32,8 @@ class AdminCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @app_commands.command(name="setlang", description="멤버 또는 역할의 번역 언어를 설정합니다 (관리자)")
-    @app_commands.describe(language="설정할 언어", member="설정할 멤버", role="설정할 역할")
+    @app_commands.command(name="setlang", description="Set translation language for a member or role (Admin)")
+    @app_commands.describe(language="Language to set", member="Member to set", role="Role to set")
     async def cmd_set_lang(
         self,
         interaction: discord.Interaction,
@@ -60,7 +60,7 @@ class AdminCog(commands.Cog):
         else:
             await interaction.response.send_message("❌ 멤버 또는 역할을 지정해주세요.", ephemeral=True)
 
-    @app_commands.command(name="userlist", description="설정된 모든 유저 및 역할의 언어 목록을 확인합니다 (관리자)")
+    @app_commands.command(name="userlist", description="List all user and role language settings (Admin)")
     async def cmd_user_list(self, interaction: discord.Interaction):
         if not interaction.user.guild_permissions.manage_guild:
             await interaction.response.send_message("❌ '서버 관리' 권한이 필요합니다.", ephemeral=True)
@@ -99,13 +99,13 @@ class AdminCog(commands.Cog):
         embed = discord.Embed(title="📋 서버 언어 설정 목록", description=full_text, color=0x3498DB)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="serverstats", description="서버 전체 통계 및 사용량 순위를 확인합니다 (관리자)")
-    @app_commands.describe(chart="차트 포함 여부")
+    @app_commands.command(name="serverstats", description="View server statistics and usage rankings (Admin)")
+    @app_commands.describe(chart="Whether to include visual charts")
     @app_commands.choices(chart=[
-        app_commands.Choice(name="안 함", value="none"),
-        app_commands.Choice(name="요청량 차트", value="usage"),
-        app_commands.Choice(name="비용 차트", value="cost"),
-        app_commands.Choice(name="모든 차트", value="all"),
+        app_commands.Choice(name="None", value="none"),
+        app_commands.Choice(name="Usage Chart", value="usage"),
+        app_commands.Choice(name="Cost Chart", value="cost"),
+        app_commands.Choice(name="All Charts", value="all"),
     ])
     async def cmd_server_stats(self, interaction: discord.Interaction, chart: str = "none"):
         if not interaction.user.guild_permissions.manage_guild:
@@ -134,7 +134,7 @@ class AdminCog(commands.Cog):
         # 예산 경고 (80% 초과 시)
         if monthly_cost >= MONTHLY_COST_LIMIT * 0.8:
             warning_lvl = "🛑 위험" if monthly_cost >= MONTHLY_COST_LIMIT else "⚠️ 주의"
-            embed.add_field(name=f"{warning_lvl} 예산 알림", value=f"설정된 월 예산(${MONTHLY_COST_LIMIT})의 {monthly_cost/MONTHLY_COST_LIMIT*100:.1;f}%를 사용 중입니다.", inline=False)
+            embed.add_field(name=f"{warning_lvl} 예산 알림", value=f"설정된 월 예산(${MONTHLY_COST_LIMIT})의 {monthly_cost/MONTHLY_COST_LIMIT*100:.1f}%를 사용 중입니다.", inline=False)
         
         # 2. 유저별 순위 (Top 10)
         if top_users:
@@ -156,32 +156,78 @@ class AdminCog(commands.Cog):
 
         await interaction.followup.send(embed=embed, files=files, ephemeral=True)
 
-    @app_commands.command(name="clearcache", description="번역 캐시를 전체 삭제합니다 (관리자)")
-    async def cmd_clear_cache(self, interaction: discord.Interaction):
+    # ── 히스토리 관리 그룹 (통합) ──
+    history_group = app_commands.Group(name="history", description="번역 캐시 및 채팅 로그 통합 관리 (관리자)")
+
+    @history_group.command(name="stats", description="Check database storage statistics.")
+    async def history_stats(self, interaction: discord.Interaction):
         if not interaction.user.guild_permissions.manage_guild:
             await interaction.response.send_message("❌ '서버 관리' 권한이 필요합니다.", ephemeral=True)
             return
-        count = await cache_clear()
-        await interaction.response.send_message(f"🗑️ 캐시 {count}개 항목이 삭제되었습니다.", ephemeral=True)
 
-    @app_commands.command(name="optimize", description="데이터베이스 용량을 최적화합니다 (관리자)")
-    async def cmd_optimize(self, interaction: discord.Interaction):
+        from database.chat_logger import get_total_log_count
+        from database.translation_cache import get_stats as get_cache_stats
+        
+        cache_stats = await get_cache_stats()
+        # 전체 채팅 로그 개수 (서버 전체)
+        from database.database import get_history_db
+        h_db = get_history_db()
+        async with h_db.execute("SELECT COUNT(*) FROM chat_logs") as cursor:
+            total_logs = (await cursor.fetchone())[0]
+
+        embed = discord.Embed(title="📜 통합 히스토리 저장 통계", color=0x9B59B6)
+        embed.add_field(name="📦 번역 캐시 (bot.db)", value=f"총 `{cache_stats['total_entries']:,}`건", inline=True)
+        embed.add_field(name="📝 채팅 로그 (history.db)", value=f"총 `{total_logs:,}`건", inline=True)
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @history_group.command(name="clear", description="Clear stored data.")
+    @app_commands.describe(target="Data to delete")
+    @app_commands.choices(target=[
+        app_commands.Choice(name="Clear translation cache (bot.db)", value="cache"),
+        app_commands.Choice(name="Clear chat logs (history.db)", value="logs"),
+        app_commands.Choice(name="Reset everything (DANGER!!)", value="all"),
+    ])
+    async def history_clear(self, interaction: discord.Interaction, target: str):
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("❌ '서버 관리' 권한이 필요합니다.", ephemeral=True)
+            return
+
+        msg = "🗑️ 삭제 완료: "
+        if target in ("cache", "all"):
+            await cache_clear()
+            msg += "[번역 캐시] "
+        if target in ("logs", "all"):
+            from database.database import get_history_db
+            h_db = get_history_db()
+            await h_db.execute("DELETE FROM chat_logs")
+            await h_db.commit()
+            msg += "[채팅 로그] "
+            
+        await interaction.response.send_message(f"✅ {msg}", ephemeral=True)
+
+    @history_group.command(name="optimize", description="Optimize database storage (VACUUM).")
+    async def history_optimize(self, interaction: discord.Interaction):
         if not interaction.user.guild_permissions.manage_guild:
             await interaction.response.send_message("❌ '서버 관리' 권한이 필요합니다.", ephemeral=True)
             return
         
         await interaction.response.defer(ephemeral=True)
-        from database.database import get_db
+        from database.database import get_db, get_history_db
         db = get_db()
+        h_db = get_history_db()
+        
         await db.execute("VACUUM")
-        await interaction.followup.send("✅ 데이터베이스 최적화(VACUUM)가 완료되었습니다.", ephemeral=True)
+        await h_db.execute("VACUUM")
+        
+        await interaction.followup.send("✅ 모든 데이터베이스(bot.db, history.db) 최적화가 완료되었습니다.", ephemeral=True)
 
-    @app_commands.command(name="setlog", description="번역 로그 채널 및 레벨을 설정합니다 (관리자)")
-    @app_commands.describe(channel="로그를 전송할 채널", level="로그 레벨")
+    @app_commands.command(name="setlog", description="Set translation log channel and level (Admin)")
+    @app_commands.describe(channel="Channel for logs", level="Log verbosity level")
     @app_commands.choices(level=[
-        app_commands.Choice(name="Minimal (에러만)", value="minimal"),
-        app_commands.Choice(name="Normal (에러 + 요약)", value="normal"),
-        app_commands.Choice(name="Verbose (모든 번역 기록)", value="verbose"),
+        app_commands.Choice(name="Minimal (Error only)", value="minimal"),
+        app_commands.Choice(name="Normal (Error + Summary)", value="normal"),
+        app_commands.Choice(name="Verbose (All records)", value="verbose"),
     ])
     async def cmd_set_log(
         self,
@@ -227,94 +273,11 @@ class AdminCog(commands.Cog):
                 await channel.send(f"📋 **번역 로그 알림**: {interaction.user.display_name}님이 이 채널을 로그 채널로 지정했습니다.")
             except: pass
 
-    @app_commands.command(name="dict", description="오타/축약어 사전을 관리합니다 (관리자)")
-    @app_commands.describe(
-        action="추가/삭제/목록",
-        category="사전 종류",
-        word="단어 또는 패턴 (목록 조회 시 불필요)",
-    )
-    @app_commands.choices(
-        action=[
-            app_commands.Choice(name="추가", value="add"),
-            app_commands.Choice(name="삭제", value="remove"),
-            app_commands.Choice(name="목록", value="list"),
-        ],
-        category=[
-            app_commands.Choice(name="오타 단어", value="typo"),
-            app_commands.Choice(name="축약어", value="abbr"),
-            app_commands.Choice(name="비표준 어미", value="ending"),
-        ],
-    )
-    async def cmd_dict(
-        self,
-        interaction: discord.Interaction,
-        action: str,
-        category: str,
-        word: str | None = None,
-    ):
-        if not interaction.user.guild_permissions.manage_guild:
-            await interaction.response.send_message("❌ '서버 관리' 권한이 필요합니다.", ephemeral=True)
-            return
-
-        if action == "list":
-            if category == "typo":
-                items = sorted(get_typo_words())
-                title = "📖 오타 단어 사전"
-            elif category == "abbr":
-                items = sorted(get_abbreviations())
-                title = "📖 축약어 사전"
-            else:
-                items = get_suspicious_endings()
-                title = "📖 비표준 어미 패턴"
-
-            if not items:
-                await interaction.response.send_message(f"{title}: (비어있음)", ephemeral=True)
-                return
-
-            text = ", ".join(items)
-            if len(text) > 1900:
-                text = text[:1900] + "..."
-
-            embed = discord.Embed(title=title, description=f"```{text}```", color=0x9B59B6)
-            embed.set_footer(text=f"총 {len(items)}개")
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
-
-        if not word:
-            await interaction.response.send_message("❌ 단어를 입력해주세요.", ephemeral=True)
-            return
-
-        if action == "add":
-            if category == "typo":
-                success = await add_typo_word(word)
-            elif category == "abbr":
-                success = await add_abbreviation(word)
-            else:
-                success = await add_ending(word)
-
-            if success:
-                await interaction.response.send_message(f"✅ `{word}` 추가 완료.", ephemeral=True)
-            else:
-                await interaction.response.send_message(f"ℹ️ `{word}`은(는) 이미 존재합니다.", ephemeral=True)
-
-        elif action == "remove":
-            if category == "typo":
-                success = await remove_typo_word(word)
-            elif category == "abbr":
-                success = await remove_abbreviation(word)
-            else:
-                success = await remove_ending(word)
-
-            if success:
-                await interaction.response.send_message(f"✅ `{word}` 삭제 완료.", ephemeral=True)
-            else:
-                await interaction.response.send_message(f"❌ `{word}`을(를) 찾을 수 없습니다.", ephemeral=True)
-
-    @app_commands.command(name="ignorechannel", description="특정 채널에서 봇 번역을 비활성화합니다 (관리자)")
-    @app_commands.describe(channel="무시할 채널", toggle="On/Off")
+    @app_commands.command(name="ignorechannel", description="Disable bot translation in a specific channel (Admin)")
+    @app_commands.describe(channel="Channel to ignore", toggle="On/Off")
     @app_commands.choices(toggle=[
-        app_commands.Choice(name="무시", value="on"),
-        app_commands.Choice(name="해제", value="off"),
+        app_commands.Choice(name="Ignore", value="on"),
+        app_commands.Choice(name="Unignore", value="off"),
     ])
     async def cmd_ignore_channel(self, interaction: discord.Interaction, channel: discord.TextChannel, toggle: str):
         if not interaction.user.guild_permissions.manage_guild:
@@ -334,7 +297,7 @@ class AdminCog(commands.Cog):
             await set_server_config(interaction.guild.id, ignored_channels=ignored)
             await interaction.response.send_message(f"✅ {channel.mention}에서 번역이 다시 활성화되었습니다.", ephemeral=True)
 
-    @app_commands.command(name="syncroles", description="모든 멤버의 역할을 스캔하여 언어 설정을 동기화합니다 (관리자)")
+    @app_commands.command(name="syncroles", description="Sync language settings by scanning all member roles (Admin)")
     async def cmd_sync_roles(self, interaction: discord.Interaction):
         if not interaction.user.guild_permissions.manage_guild:
             await interaction.response.send_message("❌ '서버 관리' 권한이 필요합니다.", ephemeral=True)
@@ -364,12 +327,12 @@ class AdminCog(commands.Cog):
 
         await interaction.followup.send(f"✅ 총 {count}명의 멤버 설정을 역할에 맞춰 업데이트했습니다. (전체 자동번역 활성화 완료)", ephemeral=True)
 
-    @app_commands.command(name="setvision", description="이미지 번역 설정을 변경합니다 (관리자)")
-    @app_commands.describe(model="사용할 비전 모델", trigger="이미지 번역 트리거 접두사")
+    @app_commands.command(name="setvision", description="Change image translation settings (Admin)")
+    @app_commands.describe(model="Vision model to use", trigger="Prefix for image translation")
     @app_commands.choices(model=[
-        app_commands.Choice(name="GPT-5 (최상위 플래그십)", value="gpt-5-2025-08-07"),
-        app_commands.Choice(name="GPT-4o (고성능)", value="gpt-4o-2024-08-06"),
-        app_commands.Choice(name="GPT-4o-mini (효율성)", value="gpt-4o-mini"),
+        app_commands.Choice(name="GPT-5 (Flagship)", value="gpt-5-2025-08-07"),
+        app_commands.Choice(name="GPT-4o (High-performance)", value="gpt-4o-2024-08-06"),
+        app_commands.Choice(name="GPT-4o-mini (Efficient)", value="gpt-4o-mini"),
     ])
     async def cmd_set_vision(self, interaction: discord.Interaction, model: str | None = None, trigger: str | None = None):
         if not interaction.user.guild_permissions.manage_guild:
@@ -385,12 +348,12 @@ class AdminCog(commands.Cog):
         new = get_vision_settings(interaction.guild.id)
         await interaction.response.send_message(f"✅ 설정 변경 완료: 모델=`{new['model']}`, 트리거=`{new['trigger']}`", ephemeral=True)
 
-    @app_commands.command(name="setchannel", description="채널 전용 번역 규칙을 설정합니다 (관리자)")
-    @app_commands.describe(channel="대상 채널", action="동작", target_lang="목표 언어")
+    @app_commands.command(name="setchannel", description="Set channel-specific translation rules (Admin)")
+    @app_commands.describe(channel="Target channel", action="Action", target_lang="Target language")
     @app_commands.choices(action=[
-        app_commands.Choice(name="설정/수정", value="on"),
-        app_commands.Choice(name="해제", value="off"),
-        app_commands.Choice(name="목록", value="list"),
+        app_commands.Choice(name="Set/Update", value="on"),
+        app_commands.Choice(name="Disable", value="off"),
+        app_commands.Choice(name="List", value="list"),
     ])
     async def cmd_set_channel(self, interaction: discord.Interaction, action: str, channel: discord.TextChannel | None = None, target_lang: str | None = None):
         if not interaction.user.guild_permissions.manage_guild:
@@ -442,6 +405,36 @@ class AdminCog(commands.Cog):
                 f"(유저 개인 설정보다 우선 적용됩니다)",
                 ephemeral=True
             )
+
+    @app_commands.command(name="reload", description="Reload code modules in real-time (Admin)")
+    @app_commands.describe(cog="Module to reload")
+    @app_commands.choices(cog=[
+        app_commands.Choice(name="Events (Listener)", value="events"),
+        app_commands.Choice(name="Commands (Basic)", value="commands"),
+        app_commands.Choice(name="Admin (Management)", value="admin"),
+        app_commands.Choice(name="Persona (Analysis)", value="persona"),
+        app_commands.Choice(name="Mentor (Chat)", value="mentor"),
+        app_commands.Choice(name="Routines (Scheduler)", value="routines"),
+    ])
+    async def cmd_reload(self, interaction: discord.Interaction, cog: str):
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("❌ '서버 관리' 권한이 필요합니다.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await self.bot.reload_extension(f"cogs.{cog}")
+            # 트리 싱크 (새 명령어가 추가되었을 수 있으므로)
+            if self.bot.guild_id:
+                await self.bot.tree.sync(guild=discord.Object(id=self.bot.guild_id))
+            else:
+                await self.bot.tree.sync()
+            
+            await interaction.followup.send(f"✅ `cogs.{cog}` 모듈이 성공적으로 새로고침되었습니다.", ephemeral=True)
+            bot_log.info(f"🔄 Reloaded cogs.{cog} by {interaction.user.display_name}")
+        except Exception as e:
+            await interaction.followup.send(f"❌ 새로고침 중 오류 발생: {e}", ephemeral=True)
+            bot_log.error(f"[RELOAD-ERROR] {e}")
 
     @cmd_set_lang.autocomplete("language")
     @cmd_set_channel.autocomplete("target_lang")

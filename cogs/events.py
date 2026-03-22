@@ -6,13 +6,14 @@ from discord.ext import commands, tasks
 from collections import OrderedDict
 from datetime import datetime
 
-from config import FLAG_TO_LANG, CONTEXT_MESSAGE_COUNT, LOG_LEVELS, LOG_BUFFER_INTERVAL, VISION_TRIGGER_PREFIX
+from config import FLAG_TO_LANG, CONTEXT_MESSAGE_COUNT, LOG_LEVELS, LOG_BUFFER_INTERVAL, VISION_TRIGGER_PREFIX, OPENAI_VISION_MODEL
 from core.translator import detect_and_translate, translate_image
 from database.user_settings import (
     get_user_lang, get_auto_translate, get_log_channel_id, get_log_level,
     get_ignored_channels, get_channel_config, get_role_lang, set_user_pref,
     get_vision_settings
 )
+from database import dictionary_manager
 
 from utils.usage_tracker import record_cache_hit, record_usage
 from utils.logger import bot_log
@@ -126,6 +127,22 @@ class EventsCog(commands.Cog):
             user_str = str(user)
         bot_log.info(f"[{event_type}] {user_str} | {content} | {extra}")
 
+    def _get_guild_nicknames(self, guild: discord.Guild) -> list[str]:
+        """서버 멤버들의 닉네임을 수집하여 리스트로 반환."""
+        if not guild:
+            return []
+        
+        # 100명 이하 소규모 서버는 전체, 대규모 서버는 최근 활동 멤버 위주(캐시된 멤버)
+        # discord.py's guild.members is usually enough if intents.members is on
+        nicknames = []
+        for member in guild.members:
+            if member.bot:
+                continue
+            nicknames.append(member.display_name)
+            if len(nicknames) >= 150: # 토큰 절약을 위한 최대 제한
+                break
+        return nicknames
+
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
         """Carl-bot 등이 역할 부여 → 자동 언어 설정."""
@@ -234,10 +251,14 @@ class EventsCog(commands.Cog):
         user_id = message.author.id
         nickname = message.author.display_name
         context_messages = await self._fetch_context(message.channel, message, CONTEXT_MESSAGE_COUNT)
+        server_nicknames = self._get_guild_nicknames(message.guild) if message.guild else []
+        custom_slang = await dictionary_manager.get_custom_slang(message.guild.id) if message.guild else {}
 
         result = await detect_and_translate(
             content, target_lang, user_id=user_id, nickname=nickname,
             use_cache=use_cache, context_messages=context_messages,
+            server_nicknames=server_nicknames,
+            custom_slang=custom_slang
         )
 
         if result.get("cache_hit"):
@@ -351,8 +372,24 @@ class EventsCog(commands.Cog):
             ignored = get_ignored_channels(message.guild.id)
             if message.channel.id in ignored:
                 return
+        else:
+            # DM인 경우 자동 번역 기능을 수행하지 않음 (API 비용 절감)
+            return
+
+        # 봇 멘션인 경우 자동 번역 스킵 (멘토 응답과 중복 방지)
+        if self.bot.user in message.mentions:
+            return
 
         self._log_event("MSG", message.author, message.content or "(empty)")
+
+        # ──────────────────────────────────────────────
+        # [NEW] 로컬 DB 채팅 로그 기록 (이미지 분석용)
+        # ──────────────────────────────────────────────
+        from database.chat_logger import record_chat_log
+        try:
+            await record_chat_log(message.author.id, message.author.display_name, message.content or "", message.channel.id)
+        except Exception as e:
+            bot_log.error(f"[LOG-ERROR] Failed to save chat log: {e}")
 
         if self._is_duplicate(f"msg:{message.id}"):
             return
@@ -430,9 +467,11 @@ class EventsCog(commands.Cog):
 
         try:
             context_messages = await self._fetch_context(after.channel, after, CONTEXT_MESSAGE_COUNT)
+            server_nicknames = self._get_guild_nicknames(after.guild) if after.guild else []
             result = await detect_and_translate(
                 content, target_lang, user_id=user_id, nickname=after.author.display_name,
                 use_cache=False, context_messages=context_messages,
+                server_nicknames=server_nicknames
             )
 
             if result["source_lang"].lower() == target_lang.lower():
@@ -540,10 +579,12 @@ class EventsCog(commands.Cog):
                     }
 
                 context_messages = await self._fetch_context(ch, await ch.fetch_message(info["original_msg_id"]), CONTEXT_MESSAGE_COUNT)
+                server_nicknames = self._get_guild_nicknames(ch.guild) if ch.guild else []
                 result = await detect_and_translate(
                     info["original_text"], info["target_lang"],
                     user_id=payload.user_id, nickname=user.display_name,
                     use_cache=False, context_messages=context_messages,
+                    server_nicknames=server_nicknames
                 )
 
                 if result["source_lang"].lower() == info["target_lang"].lower():
@@ -559,6 +600,42 @@ class EventsCog(commands.Cog):
                 self._log_event("REFRESH", user, info["original_text"][:20])
             except Exception as e:
                 self._log_event("REFRESH-ERR", "System", str(e))
+            return
+
+        # ── 📛 히라가나 위주 일본어 번역 ──
+        if emoji_str == "📛":
+            if self._is_duplicate(f"hiragana:{payload.message_id}:{payload.user_id}"):
+                return
+
+            try:
+                channel = self.bot.get_channel(payload.channel_id) or await self.bot.fetch_channel(payload.channel_id)
+                message = await channel.fetch_message(payload.message_id)
+                if not message.content or _should_skip_translation(message.content):
+                    return
+
+                user = payload.member or await self.bot.fetch_user(payload.user_id)
+                self._log_event("REACT-HIRAGANA", user, message.content[:20])
+
+                context_messages = await self._fetch_context(channel, message, CONTEXT_MESSAGE_COUNT)
+                server_nicknames = self._get_guild_nicknames(channel.guild) if channel.guild else []
+                result = await detect_and_translate(
+                    message.content, "Japanese",
+                    user_id=payload.user_id, nickname=user.display_name,
+                    use_cache=False, context_messages=context_messages,
+                    instruction="RULE: TRANSLATE NATURALLY TO JAPANESE BUT USE ONLY HIRAGANA. NO KANJI AT ALL. (Katakana is allowed for loanwords). ZERO KANJI TOLERANCE. NO EXCESSIVE PARAPHRASING.",
+                    server_nicknames=server_nicknames
+                )
+
+                embed = discord.Embed(color=0xF1C40F) # 노란색 (아이/초보 이미지)
+                embed.add_field(name=f"📝 Original Text ({result['source_lang']})", value=message.content[:1000], inline=False)
+                embed.add_field(name=f"🌐 Japanese (Hiragana)", value=result["translated"][:1000], inline=False)
+                embed.set_footer(
+                    text=f"Requested by: {user.display_name} | 📛 Hiragana Mode",
+                    icon_url=user.display_avatar.url if user.display_avatar else None,
+                )
+                await channel.send(embed=embed)
+            except Exception as e:
+                bot_log.error(f"Hiragana Reaction Error: {e}")
             return
 
         # ── 국기 리액션 번역 ──
@@ -579,10 +656,12 @@ class EventsCog(commands.Cog):
             self._log_event("REACT", user, message.content[:20], f"→ {target_lang}")
 
             context_messages = await self._fetch_context(channel, message, CONTEXT_MESSAGE_COUNT)
+            server_nicknames = self._get_guild_nicknames(channel.guild) if channel.guild else []
             result = await detect_and_translate(
                 message.content, target_lang,
                 user_id=payload.user_id, nickname=user.display_name,
                 use_cache=True, context_messages=context_messages,
+                server_nicknames=server_nicknames
             )
 
             if result.get("cache_hit"):

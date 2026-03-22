@@ -174,3 +174,36 @@ async def remove_ending(pattern: str) -> bool:
     await db.commit()
     _suspicious_endings.remove(pattern)
     return True
+
+
+# ──────────────────────────────────────────────
+# [NEW] Custom Slang (Guild-specific)
+# ──────────────────────────────────────────────
+async def get_custom_slang(guild_id: str) -> dict[str, str]:
+    """해당 서버의 커스텀 줄임말 사전 가져오기."""
+    db = get_db()
+    slang_dict = {}
+    async with db.execute("SELECT short_form, full_meaning FROM custom_slang WHERE guild_id = ?", (str(guild_id),)) as cursor:
+        async for row in cursor:
+            slang_dict[row[0]] = row[1]
+    return slang_dict
+
+
+async def add_custom_slang(guild_id: str, short_form: str, full_meaning: str) -> None:
+    db = get_db()
+    await db.execute(
+        "INSERT OR REPLACE INTO custom_slang (guild_id, short_form, full_meaning) VALUES (?, ?, ?)",
+        (str(guild_id), short_form, full_meaning)
+    )
+    await db.commit()
+
+
+async def remove_custom_slang(guild_id: str, short_form: str) -> bool:
+    db = get_db()
+    async with db.execute("SELECT 1 FROM custom_slang WHERE guild_id = ? AND short_form = ?", (str(guild_id), short_form)) as cursor:
+        if not await cursor.fetchone():
+            return False
+    
+    await db.execute("DELETE FROM custom_slang WHERE guild_id = ? AND short_form = ?", (str(guild_id), short_form))
+    await db.commit()
+    return True

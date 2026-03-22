@@ -1,4 +1,4 @@
-# translation_cache.py — SQLite 기반 번역 캐시
+# translation_cache.py — SQLite 기반 번역 캐시 (유저 식별자 포함)
 
 import re
 import hashlib
@@ -21,6 +21,7 @@ def _make_key(text: str, target_lang: str) -> str:
 
 
 async def get_cached(text: str, target_lang: str) -> dict | None:
+    """캐시된 번역 결과를 가져옵니다."""
     key = _make_key(text, target_lang)
     db = get_db()
     async with db.execute(
@@ -32,13 +33,14 @@ async def get_cached(text: str, target_lang: str) -> dict | None:
         return None
 
 
-async def set_cached(text: str, target_lang: str, source_lang: str, translated: str):
+async def set_cached(text: str, target_lang: str, source_lang: str, translated: str, user_id: str = None):
+    """번역 결과를 캐시에 저장합니다. (유저 ID 포함)"""
     key = _make_key(text, target_lang)
     db = get_db()
     await db.execute(
-        """INSERT OR REPLACE INTO cache (key, original, target_lang, source_lang, translated)
-           VALUES (?, ?, ?, ?, ?)""",
-        (key, text, target_lang, source_lang, translated)
+        """INSERT OR REPLACE INTO cache (key, original, target_lang, source_lang, translated, user_id)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (key, text, target_lang, source_lang, translated, user_id)
     )
     await db.commit()
 

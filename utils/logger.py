@@ -36,6 +36,7 @@ def setup_logger(name: str, log_file: str, level=logging.INFO):
     return logger
 
 
-# Default logger for the bot
+# Default loggers
 tlog = setup_logger("translator", "translator.log")
 bot_log = setup_logger("bot", "bot.log")
+mentor_log = setup_logger("mentor", "mentor.log", level=logging.DEBUG)

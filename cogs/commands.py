@@ -14,7 +14,7 @@ class CommandsCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @app_commands.command(name="translate", description="텍스트를 번역합니다")
+    @app_commands.command(name="translate", description="Translate text to your preferred language.")
     async def cmd_translate(self, interaction: discord.Interaction, text: str, language: str | None = None):
         target_lang = language or get_user_lang(interaction.user.id)
         await interaction.response.defer()
@@ -38,10 +38,10 @@ class CommandsCog(commands.Cog):
         except Exception:
             await interaction.followup.send(
                 embed=discord.Embed(description="⚠️ 번역 중 오류가 발생했습니다.", color=discord.Color.orange()),
-                ephemeral=True,
+                ephemeral=False,
             )
 
-    @app_commands.command(name="status", description="본인의 현재 설정 및 번역 사용량을 확인합니다")
+    @app_commands.command(name="status", description="Check your current settings and translation usage.")
     async def cmd_status(self, interaction: discord.Interaction):
         user_id = interaction.user.id
         lang = get_user_lang(user_id)
@@ -72,7 +72,7 @@ class CommandsCog(commands.Cog):
             
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="languages", description="지원하는 번역 언어 목록을 확인합니다")
+    @app_commands.command(name="languages", description="View the list of supported translation languages.")
     async def cmd_languages(self, interaction: discord.Interaction):
         langs = ", ".join(SUPPORTED_LANGUAGES)
         await interaction.response.send_message(f"🌐 **지원 언어 안내**\n```{langs}```", ephemeral=True)
