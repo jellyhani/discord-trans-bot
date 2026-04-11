@@ -1,4 +1,5 @@
 from database.database import get_db, get_history_db
+import re
 from datetime import datetime
 
 async def record_chat_log(user_id: int, nickname: str, content: str, channel_id: int):
@@ -68,7 +69,7 @@ async def get_sessions(user_id: int, include_deleted: bool = False) -> list[dict
         return [dict(row) for row in rows]
 
 async def get_active_session_id(user_id: int) -> int | None:
-    """유저의 현재 활성화된 세션 ID를 가져옵니다. 없으면 첫 세션을 자동 생성합니다."""
+    """유저의 현재 활성화된 세션 ID를 가져옵니다. 없으면 None을 반환합니다."""
     db = get_history_db()
     uid = str(user_id)
     async with db.execute(
@@ -79,15 +80,8 @@ async def get_active_session_id(user_id: int) -> int | None:
         if row:
             return row[0]
         
-    # 만약 활성 세션이 없으면 하나 만들어줌 (또는 기존 꺼 중 하나 활성화)
-    sessions = await get_sessions(user_id)
-    if not sessions:
-        return await create_session(user_id, "New Conversation")
-    
-    # 마지막(최신) 세션을 활성화
-    session_id = sessions[0]["id"]
-    await switch_session(user_id, session_id)
-    return session_id
+    # [수정] 자동으로 생성하거나 전환하지 않고 None 반환 (명시적 /newchat 필요)
+    return None
 
 async def archive_session(user_id: int, session_id: int) -> bool:
     """세션을 '소프트 삭제(아카이브)' 처리합니다."""
@@ -190,50 +184,72 @@ async def get_all_cache_texts(user_id: int = None, limit: int = None) -> list:
 
 async def get_user_total_history(user_id: int, max_chars: int = 100000) -> str:
     """
-    [UNIFIED ENGINE] 공용 데이터를 제외하고 오직 해당 유저의 개인 로그, 개인 캐시, 멘토 로그를 합쳐서 반환합니다.
-    [NEW] 삭제되지 않은 세션의 멘토 로그만 포함합니다.
+    [UNIFIED ENGINE] 유저의 개인 로그, 개인 캐시, 멘토 로그를 합쳐서 반환합니다.
+    [REFINED] 첫 세션인 경우 모든 과거 기록을 포함하고, /newchat 이후 세션은 해당 시점부터의 기록만 포함합니다.
     """
-    # 1. 개인 채팅 로그 수집
-    user_logs = await get_chat_logs(user_id)
-    
-    # 2. 멘토 로그 수집 (모든 비삭제 세션)
     db = get_history_db()
+    uid = str(user_id)
+    
+    # 1. 현재 세션 정보 확인
+    active_sid = await get_active_session_id(user_id)
+    all_sessions = await get_sessions(user_id)
+    # 가장 옛날에 생성된 세션 ID 확인
+    first_sid = all_sessions[-1]["id"] if all_sessions else None
+    
+    is_first_session = (active_sid == first_sid)
+    
+    # 2. 멘토 로그 수집
     mentor_logs = []
-    async with db.execute("""
-        SELECT question, answer, timestamp 
-        FROM mentor_logs 
-        WHERE user_id = ? AND session_id IN (SELECT id FROM mentor_sessions WHERE user_id = ? AND is_deleted = 0)
-        ORDER BY timestamp DESC
-    """, (str(user_id), str(user_id))) as cursor:
-        rows = await cursor.fetchall()
-        mentor_logs = [{"question": r[0], "answer": r[1], "timestamp": r[2]} for r in reversed(rows)]
-    
-    # 3. 개인용 캐시 수집 (번역 기록)
-    user_cache = await get_all_cache_texts(user_id=user_id)
-    
+    if is_first_session:
+        # 첫 세션이면 모든 비삭제 세션의 로그 포함
+        async with db.execute("""
+            SELECT question, answer, timestamp FROM mentor_logs 
+            WHERE user_id = ? AND session_id IN (SELECT id FROM mentor_sessions WHERE user_id = ? AND is_deleted = 0)
+            ORDER BY timestamp DESC
+        """, (uid, uid)) as cursor:
+            rows = await cursor.fetchall()
+            mentor_logs = [{"question": r[0], "answer": r[1], "timestamp": r[2]} for r in reversed(rows)]
+    else:
+        # 이후 세션이면 현재 세션의 로그만 포함
+        async with db.execute("""
+            SELECT question, answer, timestamp FROM mentor_logs 
+            WHERE user_id = ? AND session_id = ?
+            ORDER BY timestamp DESC
+        """, (uid, active_sid)) as cursor:
+            rows = await cursor.fetchall()
+            mentor_logs = [{"question": r[0], "answer": r[1], "timestamp": r[2]} for r in reversed(rows)]
+
+    # 3. 개인 채팅 로그 및 캐시 요약
     combined = []
     
-    # 개인 채팅 로그 추가 (시간 정보 포함)
-    for log in user_logs:
-        # timestamp format: 2024-03-19 11:10:33
-        time_str = log['timestamp']
-        hour = time_str.split(" ")[1].split(":")[0] if " " in time_str else "??"
-        combined.append(f"[{hour}h] Chat: {log['content']}")
+    # 첫 세션일 때만 방대한 과거 채팅/캐시 로그를 불러옴
+    if is_first_session:
+        user_logs = await get_chat_logs(user_id)
+        user_cache = await get_all_cache_texts(user_id=user_id)
         
-    # 멘토 로그 추가
+        for log in user_logs:
+            time_str = log['timestamp']
+            hour = time_str.split(" ")[1].split(":")[0] if " " in time_str else "??"
+            combined.append(f"[{hour}h] Chat: {log['content']}")
+            
+        for text in user_cache:
+            combined.append(f"[??h] Translation: {text}")
+
+    # 공통: 멘토 로그 추가 (현재 세션이든 과거 전체든 위에서 걸러짐)
     for log in mentor_logs:
+        q = log['question']
+        a = log['answer']
+        # [필터링] INFO_RELAY(신상정보 문의 알림) 및 특정 키워드 포함 메시지 제외
+        if "🔔 **신상정보 문의 알림**" in q or "INFO_RELAY" in a:
+            continue
+        # [필터링] 다른 유저 ID가 언급된 메타 대화 제외 (개발자용)
+        if re.search(r'\d{17,20}', q) and ("프롬프트" in q or "persona" in q.lower()):
+            continue
+            
         time_str = log['timestamp']
         hour = time_str.split(" ")[1].split(":")[0] if " " in time_str else "??"
-        combined.append(f"[{hour}h] Mentor Question: {log['question']}")
-        combined.append(f"[{hour}h] Mentor Answer: {log['answer']}")
-        
-    # 개인 번역 로그 추가
-    for text in user_cache:
-        combined.append(f"[??h] Translation: {text}")
+        combined.append(f"[{hour}h] Mentor Question: {q}")
+        combined.append(f"[{hour}h] Mentor Answer: {a}")
         
     full_text = "\n".join(combined)
-    
-    if len(full_text) > max_chars:
-        return full_text[:max_chars]
-    
-    return full_text
+    return full_text[:max_chars] if len(full_text) > max_chars else full_text

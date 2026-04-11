@@ -145,6 +145,14 @@ async def init() -> None:
             answer TEXT,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS routine_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            routine_id INTEGER,
+            content TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (routine_id) REFERENCES routines(id) ON DELETE CASCADE
+        );
     """)
     await _db.commit()
 
@@ -334,3 +342,24 @@ async def get_all_developer_knowledge() -> list[dict]:
     async with db.execute("SELECT question, answer FROM developer_knowledge ORDER BY updated_at ASC") as cursor:
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
+
+# ──────────────────────────────────────────────
+# [NEW] Routine History Helper Functions
+# ──────────────────────────────────────────────
+
+async def save_routine_history(r_id: int, content: str) -> None:
+    db = get_db()
+    await db.execute(
+        "INSERT INTO routine_history (routine_id, content) VALUES (?, ?)",
+        (r_id, content)
+    )
+    await db.commit()
+
+async def get_routine_history(r_id: int, limit: int = 5) -> list[str]:
+    db = get_db()
+    async with db.execute(
+        "SELECT content FROM routine_history WHERE routine_id = ? ORDER BY timestamp DESC LIMIT ?",
+        (r_id, limit)
+    ) as cursor:
+        rows = await cursor.fetchall()
+        return [row[0] for row in rows]

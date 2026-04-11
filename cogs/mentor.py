@@ -120,7 +120,10 @@ class MentorCog(commands.Cog):
         
         # 1. 입력 정제 가공
         clean_content = message.content.replace(f'<@{self.bot.user.id}>', '').replace(f'<@!{self.bot.user.id}>', '').strip()
-        if not clean_content and not message.reference:
+        has_images = any(a.content_type and a.content_type.startswith('image/') for a in message.attachments)
+        
+        # 텍스트 설명이 없으면 이미지 분석을 수행하지 않음 (단순 멘션+이미지 스킵)
+        if not clean_content:
             return
 
         mentor_log.debug(f"===== [MENTOR-START] User: {nickname}({user_id}) =====")
@@ -128,7 +131,9 @@ class MentorCog(commands.Cog):
 
         async with message.channel.typing():
             try:
-                # 2. 레퍼런스 메시지 파악
+                # 2. 이미지 및 레퍼런스 메시지 파악
+                image_urls = [a.url for a in message.attachments if a.content_type and a.content_type.startswith('image/')]
+                
                 reference_content = None
                 if message.reference and message.reference.resolved:
                     reference_content = message.reference.resolved.content
@@ -139,7 +144,8 @@ class MentorCog(commands.Cog):
                     nickname=nickname,
                     content=clean_content,
                     reference_content=reference_content,
-                    original_message=message
+                    original_message=message,
+                    image_urls=image_urls
                 )
                 
                 answer = result["answer"]
@@ -149,7 +155,10 @@ class MentorCog(commands.Cog):
                 # 4. 제작자 릴레이 처리 (Cog 레벨에서 UI 처리)
                 if needs_relay:
                     req_id = await add_pending_inquiry(str(user_id), str(message.channel.id), str(message.id), relay_question)
-                    dev_id = 702032224043925545
+                    from os import getenv
+                    dev_uid_str = getenv("DEVELOPER_UID")
+                    dev_id = int(dev_uid_str) if dev_uid_str and dev_uid_str.isdigit() else 0
+                    
                     dev_user = self.bot.get_user(dev_id) or await self.bot.fetch_user(dev_id)
                     if dev_user:
                         await dev_user.send(
@@ -185,7 +194,10 @@ class MentorCog(commands.Cog):
         if not isinstance(message.channel, discord.DMChannel) or message.author.bot:
             return
 
-        dev_id = 702032224043925545
+        from os import getenv
+        dev_uid_str = getenv("DEVELOPER_UID")
+        dev_id = int(dev_uid_str) if dev_uid_str and dev_uid_str.isdigit() else 0
+        
         if message.author.id != dev_id:
             return
 

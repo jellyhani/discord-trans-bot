@@ -1,7 +1,11 @@
 import discord
 from discord.ext import commands, tasks
 from datetime import datetime
-from database.database import get_due_routines, update_routine_last_run, add_routine, get_user_routines, delete_routine
+from database.database import (
+    get_due_routines, update_routine_last_run, add_routine, 
+    get_user_routines, delete_routine, get_routine_history, 
+    save_routine_history
+)
 from discord import app_commands
 import asyncio
 
@@ -51,14 +55,13 @@ class RoutineCog(commands.Cog):
         nickname = target.display_name if hasattr(target, 'display_name') else target.name if hasattr(target, 'name') else "User"
 
         try:
-            # AI 엔진을 통한 정기 루틴 실행 요청
-            prompt = f"Executing scheduled routine: {t_type} about '{query}'. "
-            if t_type == 'search':
-                prompt += "Search for the latest info and provide a detailed summary. Include sources."
-            elif t_type == 'weather':
-                prompt += f"Provide a detailed weather report for {query}."
-            elif t_type == 'news':
-                prompt += f"Search for the latest news headlines about {query}."
+            # [NEW] 루틴 메모리(이력) 조회 및 프롬프트 주입
+            history = await get_routine_history(task["id"], limit=5)
+            prompt = f"System: Generate {t_type} result for '{query}'."
+            if history:
+                history_context = "\n- ".join(history)
+                prompt += f"\n\n### Previous outputs for this routine (Avoid Duplicates):\n- {history_context}"
+                prompt += "\n\nCRITICAL: Do NOT repeat the items mentioned above. Provide new, different, or more advanced content."
 
             result = await self.engine.generate_response(
                 user_id=user_id,
@@ -68,6 +71,9 @@ class RoutineCog(commands.Cog):
             )
             
             answer = result["answer"]
+            
+            # [NEW] 실행 결과 저장
+            await save_routine_history(task["id"], answer)
             
             from utils.discord_utils import split_send
             mention = f"<@{user_id}>" if destination != "dm" else ""
@@ -114,11 +120,13 @@ class RoutineCog(commands.Cog):
         """
         
         try:
+            # [FIX] 추후 gpt-5 등으로 모델 변경 시 호환성 유지
+            is_reasoning = "gpt-5" in "gpt-4o-mini" or "o1" in "gpt-4o-mini"
             resp = await client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": extract_prompt}],
                 response_format={"type": "json_object"},
-                max_tokens=250
+                **( {"max_completion_tokens": 250} if is_reasoning else {"max_tokens": 250} )
             )
             data = json.loads(resp.choices[0].message.content)
             
@@ -153,41 +161,8 @@ class RoutineCog(commands.Cog):
         except Exception as e:
             from utils.logger import bot_log
             bot_log.error(f"[NATURAL-ROUTINE-ERROR] {e}")
-            await interaction.followup.send("❌ An error occurred during routine parsing. Please use `/routine-add` for manual setup.")
+            await interaction.followup.send("❌ 루틴 분석 중 오류가 발생했습니다. 더 명확하게 다시 말씀해 주시거나, 멘토봇(@멘토봇)에게 직접 루틴 등록을 부탁해 보세요.")
 
-    @app_commands.command(name="routine-add", description="Add a task manually using structured fields.")
-    @app_commands.describe(
-        type="Select the category of the task",
-        query="The specific topic or city (e.g., 'Apple stock', 'Seoul', 'AI news')",
-        time="Time to run (HH:MM format, e.g., 07:30, 22:00)",
-        destination="Where the bot should send the result"
-    )
-    @app_commands.choices(type=[
-        app_commands.Choice(name="🔍 Search (Custom query summary)", value="search"),
-        app_commands.Choice(name="☀️ Weather (Daily weather report)", value="weather"),
-        app_commands.Choice(name="📰 News (Latest news headlines)", value="news")
-    ], destination=[
-        app_commands.Choice(name="📺 Channel (Send to this channel)", value="channel"),
-        app_commands.Choice(name="📩 DM (Send to my private DM)", value="dm")
-    ])
-    async def add_routine_cmd(self, interaction: discord.Interaction, type: str, query: str, time: str, destination: str = "channel"):
-        # Validate time format
-        try:
-            datetime.strptime(time, "%H:%M")
-        except ValueError:
-            await interaction.response.send_message("❌ Invalid time format. Please use HH:MM (e.g., 09:00).", ephemeral=False)
-            return
-
-        if type not in ['search', 'weather', 'news']:
-            await interaction.response.send_message("❌ Type must be search, weather, or news.", ephemeral=False)
-            return
-        
-        if destination not in ['channel', 'dm']:
-            await interaction.response.send_message("❌ Destination must be channel or dm.", ephemeral=False)
-            return
-
-        await add_routine(str(interaction.user.id), str(interaction.channel_id), type, query, time, destination=destination)
-        await interaction.response.send_message(f"✅ Scheduled **{type}**({query}) for **{time}** to **{destination}**!", ephemeral=False)
 
     @app_commands.command(name="routine-list", description="List all your active daily routines.")
     async def list_routines_cmd(self, interaction: discord.Interaction):

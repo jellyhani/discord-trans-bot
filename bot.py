@@ -36,6 +36,7 @@ intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
 intents.reactions = True
+intents.presences = True  # [프로필 조회] 유저의 현재 활동(게임, 스포티파이 등) 감지
 
 
 class TranslateBot(commands.Bot):

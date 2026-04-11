@@ -217,7 +217,7 @@ async def remove_role_lang(role_id: int) -> bool:
 # 채널 설정
 # ──────────────────────────────────────────────
 def get_channel_config(channel_id: int) -> dict:
-    return _channel_cache.get(str(channel_id), {})
+    return _channel_cache.get(int(channel_id), {})
 
 
 async def set_channel_config(channel_id: int, guild_id: int, **kwargs):

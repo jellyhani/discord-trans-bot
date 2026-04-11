@@ -4,6 +4,7 @@ import re
 import asyncio
 import logging
 import os
+import hashlib
 from utils.logger import tlog
 from typing import Optional, List
 from openai import AsyncOpenAI, APIError, APITimeoutError, RateLimitError
@@ -13,8 +14,6 @@ from config import (
     OPENAI_MODEL,
     OPENAI_REASONING_MODEL,
     OPENAI_MODEL_SMART,
-    TRANSLATION_SYSTEM_PROMPT,
-    CONTEXT_TRANSLATION_SYSTEM_PROMPT,
     OPENAI_VISION_MODEL,
     VISION_SYSTEM_PROMPT,
     API_MAX_RETRIES,
@@ -22,8 +21,9 @@ from config import (
     QUEUE_MAX_CONCURRENT,
     CONTEXT_MESSAGE_COUNT
 )
+from core.prompt_manager import prompt_manager
 from database.translation_cache import get_cached, set_cached
-from utils.usage_tracker import record_usage, record_daily_stats
+from utils.usage_tracker import record_usage, record_daily_stats, check_budget_exceeded
 from core.typo_detector import looks_like_typo
 from core.punctuation_handler import analyze_punctuation, build_ai_input, restore_punctuation
 
@@ -76,6 +76,14 @@ async def _api_call_with_retry(coro_factory, max_retries: int = API_MAX_RETRIES)
                 last_error = e
                 if attempt < max_retries - 1:
                     wait = API_RETRY_DELAY * (2 ** attempt)
+                    tlog.warning(f"[API-RETRY] Attempt {attempt+1}/{max_retries} failed with {e.__class__.__name__}: {e}. Retrying in {wait}s.")
+                    await asyncio.sleep(wait)
+            except Exception as e:
+                # Catch unexpected errors such as 503 Service Unavailable
+                last_error = e
+                if attempt < max_retries - 1:
+                    wait = API_RETRY_DELAY * (2 ** attempt)
+                    tlog.warning(f"[API-RETRY] Unexpected error on attempt {attempt+1}/{max_retries}: {e}. Retrying in {wait}s.")
                     await asyncio.sleep(wait)
         raise last_error
 
@@ -96,9 +104,17 @@ async def _unified_translate_api(
     """
     언어 감지, 오타 교정, 번역을 한 번의 API 호출로 수행.
     """
+    if await check_budget_exceeded():
+        tlog.warning(f"[SECURITY] Translation API blocked due to monthly budget limit.")
+        return target_language, text, "⚠️ 이번 달 API 사용 예산이 모두 소진되어 번역 기능을 사용할 수 없습니다. 관리자에게 문의하세요.", False, None
+
     client = _get_client()
     use_context = context_messages and len(context_messages) > 0
-    system_prompt = CONTEXT_TRANSLATION_SYSTEM_PROMPT if use_context else TRANSLATION_SYSTEM_PROMPT
+    # 2. 시스템 프롬프트 로드
+    if use_context:
+        system_content = prompt_manager.get_prompt("translation", "context_system")
+    else:
+        system_content = prompt_manager.get_prompt("translation", "system")
 
     # 모델 선택: 오버라이드가 있으면 사용, 없으면 기본 모델
     target_model = model_override or OPENAI_MODEL
@@ -147,7 +163,7 @@ async def _unified_translate_api(
     response = await _api_call_with_retry(lambda: client.chat.completions.create(
         model=target_model,
         messages=[
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": prompt},
         ],
         **( {"max_completion_tokens": max_tokens_val} if is_reasoning else {"max_tokens": max_tokens_val} ),
@@ -162,8 +178,9 @@ async def _unified_translate_api(
 
     # 응답 파싱 (DETECTED, CORRECTED, TRANSLATED 필드 추출)
     def extract_field(label, text_block):
-        # 다음 라벨이나 문자열 끝까지 탐욕적으로 수집 (DOTALL 사용)
-        pattern = rf"(?i)(?:\*\*|__)?{label}(?:\*\*|__)?\s*:\s*(.*?)(?=\s*(?:\n(?:\*\*|__)?(?:DETECTED|CORRECTED|TRANSLATED|TEXT)(?:\*\*|__)?\s*:|$))"
+        # 다음 라벨 전까지 또는 문자열 끝까지 최대한 수집
+        # [?!] 줄바꿈 뒤에 바로 라벨이 붙어 나오는 경우를 대비하여 \s* 와 \n? 조합 최적화
+        pattern = rf"(?i)(?:\*\*|__)?{label}(?:\*\*|__)?\s*:\s*(.*?)(?=\s*\n(?:\*\*|__)?(?:DETECTED|CORRECTED|TRANSLATED|TEXT)(?:\*\*|__)?\s*:|$)"
         match = re.search(pattern, text_block, re.DOTALL)
         if match:
             res = match.group(1).strip()
@@ -176,13 +193,17 @@ async def _unified_translate_api(
     corrected_text = extract_field("CORRECTED", content) or text
     translated_text = extract_field("TRANSLATED", content) or ""
 
-    # 만약 파싱에 실패했다면 (라인 형식이 완전히 틀린 경우) 줄 단위로 시도
+    # ── [Fallback] 파싱 실패 시 지능적 복구 ──
     if not translated_text:
+        # 1. TRANSLATED 라벨 없이 그냥 결과만 내뱉었는지 확인
         lines = [l.strip() for l in content.split("\n") if l.strip()]
-        if len(lines) >= 3:
-            translated_text = lines[2].split(":", 1)[-1].strip() if ":" in lines[2] else lines[2]
-        elif len(lines) >= 1:
-            translated_text = lines[-1].split(":", 1)[-1].strip() if ":" in lines[-1] else lines[-1]
+        if len(lines) > 0:
+            # 마지막 줄이 충분히 길면 번역문으로 간주 (또는 전체를 번역문으로)
+            # 만약 DETECTED:, CORRECTED: 라벨이 포함되어 있다면 그것들은 제외
+            filtered_content = re.sub(r"(?i)(?:DETECTED|CORRECTED|TRANSLATED|TEXT)\s*:\s*.*?\n", "", content + "\n", flags=re.DOTALL).strip()
+            if len(filtered_content) > 10:
+                translated_text = filtered_content
+                tlog.info("[UNIFIED-API] Recovered translation from loose format.")
 
     # 최종 안전장치: 빈 결과 방지 (원문을 번역문으로 사용)
     if not translated_text:
@@ -194,47 +215,60 @@ async def _unified_translate_api(
     return source_lang, corrected_text, translated_text, was_correction, usage
 
 
-async def _ai_router_judge(text: str, target_language: str) -> tuple[bool, Optional[dict]]:
+async def _ai_router_judge(
+    text: str, 
+    target_language: str,
+    server_nicknames: Optional[List[str]] = None,
+    custom_slang: Optional[dict[str, str]] = None
+) -> tuple[bool, Optional[dict]]:
     """
     GPT-4.1 mini를 사용하여 문맥 필요 여부를 1차 판별.
     필요 없다면 여기서 바로 번역 결과까지 가져옴 (Latency 최적화).
     """
+    if await check_budget_exceeded():
+        tlog.warning(f"[SECURITY] Translation API (Router) blocked due to monthly budget limit.")
+        return False, {
+            "source_lang": target_language,
+            "translated": "⚠️ 이번 달 API 사용 예산이 모두 소진되어 번역 기능을 사용할 수 없습니다.",
+            "model": "BudgetBlocker",
+            "cache_hit": False,
+            "was_correction": False,
+            "usage": None
+        }
+
     client = _get_client()
     # 라우팅용 프롬프트: 문맥이 꼭 필요한지 물어보고, 아니면 바로 번역하게 함
-    prompt = f"""# Task: Route and Translate
-Determine if the following text needs previous conversation context to be translated naturally and accurately into {target_language}.
+    base_judge_prompt = prompt_manager.get_prompt("router", "judge_prompt")
+    prompt = base_judge_prompt.format(target_language=target_language, text=text)
 
-Input: {text}
+    if server_nicknames or custom_slang:
+        prompt += "## Context Meta (Proprietary):\n"
+        if server_nicknames:
+            prompt += f"- Server Nicknames: {', '.join(server_nicknames)}\n"
+        if custom_slang:
+            prompt += f"- Slang: {list(custom_slang.keys())}\n"
+        prompt += "Rule: Use nicknames as Proper Nouns. Do NOT translate nicknames unless they are clearly common nouns in a non-personal context.\n"
 
-## Rules:
-1. If context is ABSOLUTELY necessary (e.g., ambiguous pronouns, fragments like "Go", "Right", "Do it"), just output exactly: UPGRADE
-2. If the text is clear enough to translate accurately without context, you MUST provide the translation into {target_language}.
-3. The format MUST be exactly 3 lines:
-DETECTED: <Source Language>
-CORRECTED: <Normalized Source Text>
-TRANSLATED: <Natural Translation in {target_language}>
-
-IMPORTANT: Every character in the TRANSLATED field MUST be in {target_language}.
-NO extra explanations or text."""
+    prompt += "\nNO extra explanation."
 
     try:
         response = await _api_call_with_retry(lambda: client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=500,
+            max_tokens=2000,
             temperature=0.3
         ))
         content = response.choices[0].message.content.strip()
         usage = response.usage
         
-        # 'UPGRADE'가 포함되어 있고 내용이 짧으면 (오탐 방지) 업그레이드 신호로 간주
-        if "UPGRADE" in content and len(content) < 15:
+        content_upper = content.upper()
+        # 'UPGRADE' (또는 오타)가 포함되어 있고 내용이 짧으면 업그레이드 신호로 간주
+        if ("UPGRADE" in content_upper or "UPGARADE" in content_upper) and len(content) < 30:
             return True, None
             
-        # 결과 파싱 시도
+        # 결과 파싱 시도 (통합 정규식 사용)
         def extract_field(label, text_block):
-            # 다음 라벨이나 문자열 끝까지 탐욕적으로 수집 (DOTALL 사용)
-            pattern = rf"(?i)(?:\*\*|__)?{label}(?:\*\*|__)?\s*:\s*(.*?)(?=\s*(?:\n(?:\*\*|__)?(?:DETECTED|CORRECTED|TRANSLATED|TEXT)(?:\*\*|__)?\s*:|$))"
+            pattern = rf"(?i)(?:\*\*|__)?{label}(?:\*\*|__)?\s*:\s*(.*?)(?=\s*\n(?:\*\*|__)?(?:DETECTED|CORRECTED|TRANSLATED|TEXT)(?:\*\*|__)?\s*:|$)"
             match = re.search(pattern, text_block, re.DOTALL)
             if match:
                 res = match.group(1).strip()
@@ -248,6 +282,11 @@ NO extra explanations or text."""
 
         if not translated_text:
             return True, None # 파싱 실패 시 안전하게 업그레이드
+            
+        # [FIX] AI가 3필드 포맷을 지키면서 TRANSLATED 필드 안에 'UPGRADE'나 오타를 넣는 경우 처리
+        if translated_text.upper().strip() in ["UPGRADE", "UPGARADE", "업그레이드"]:
+            tlog.warning(f"[ROUTER-FALLBACK] Model put UPGRADE in translated field. Upgrading...")
+            return True, None
             
         # [안전장치] 번역문이 원문과 동일하다면 (번역 실패) 업그레이드
         if translated_text.strip() == text.strip() and len(text.strip()) > 1:
@@ -342,6 +381,28 @@ def _is_complex_text(text: str) -> bool:
     return False
 
 
+def _get_context_key(instruction: str | None, server_nicknames: list[str] | None, custom_slang: dict[str, str] | None) -> str | None:
+    """지시사항, 닉네임, 줄임말 정보를 조합하여 고유한 컨텍스트 키 생성."""
+    if not instruction and not server_nicknames and not custom_slang:
+        return None
+    
+    parts = []
+    if instruction:
+        parts.append(f"inst:{instruction}")
+    if server_nicknames:
+        # 서버 멤버가 많을 수 있으므로 정렬하여 안정적인 키 생성
+        sorted_nicks = sorted(server_nicknames)
+        parts.append(f"nicks:{','.join(sorted_nicks)}")
+    if custom_slang:
+        sorted_keys = sorted(custom_slang.keys())
+        slang_str = ",".join([f"{k}:{custom_slang[k]}" for k in sorted_keys])
+        parts.append(f"slang:{slang_str}")
+    
+    combined = "|".join(parts)
+    # 너무 길어질 수 있으므로 MD5 해시로 단축
+    return hashlib.md5(combined.encode("utf-8")).hexdigest()
+
+
 # ──────────────────────────────────────────────
 # 메인 파이프라인
 # ──────────────────────────────────────────────
@@ -364,9 +425,10 @@ async def detect_and_translate(
     ai_input_text = build_ai_input(clean_text, semantic_mark)
 
     # ── 2. 캐시 확인 ──
-    # 커스텀 지시사항이나 닉네임 목록, 커스텀 줄임말이 있는 경우 캐시 무시
-    if use_cache and not instruction and not server_nicknames and not custom_slang:
-        cached = await get_cached(ai_input_text, target_language)
+    context_key = _get_context_key(instruction, server_nicknames, custom_slang)
+    
+    if use_cache:
+        cached = await get_cached(ai_input_text, target_language, context_key=context_key)
         if cached:
             restored = restore_punctuation(cached["translated"], semantic_mark, emphasis_raw)
             tlog.info(f"[CACHE-HIT] \"{clean_text[:30]}\" → {target_language}")
@@ -386,21 +448,31 @@ async def detect_and_translate(
     target_model = OPENAI_MODEL
     router_result = None
 
-    # 문량이 길거나(30자 초과) 언어적 난도가 높은 경우(말장난 등)는 바로 처리
-    # [FIX] 커스텀 지시사항(instruction)이나 닉네임 정보가 있는 경우 라우터를 건너뜀
-    if instruction or server_nicknames or custom_slang or len(clean_text) > 30 or _is_complex_text(clean_text):
-        target_model = OPENAI_MODEL_SMART if _is_complex_text(clean_text) else OPENAI_MODEL
-        tlog.info(f"[ROUTING] Direct Path (inst={bool(instruction)}, nick={bool(server_nicknames)}) -> model={target_model}")
+    # [HYBRID ROUTING] 유저 제안 반영: 가벼운 모델(Mini)이 먼저 판단하고 복잡할 때만 업그레이드
+    is_persona_result = "EMBED_" in text or "TITLE:" in text
+    
+    # 페르소나 결과는 라우터도 필요 없는 확정적 Mini 모델 대상
+    if is_persona_result:
+        target_model = OPENAI_MODEL
+        tlog.info(f"[ROUTING] Structured Content (Persona) -> model={target_model}")
+    elif instruction or len(clean_text) > 3000:
+        target_model = OPENAI_MODEL # gpt-4.1-mini (빠른 응답)
+        tlog.info(f"[ROUTING] Special Case/Long Content (instruction={bool(instruction)}) -> model={target_model} (Fast Bypass)")
     else:
-        # 짧은 문장은 AI가 판단하여 업그레이드 여부 결정
-        should_upgrade, result = await _ai_router_judge(ai_input_text, target_language)
+        should_upgrade, result = await _ai_router_judge(
+            ai_input_text, 
+            target_language,
+            server_nicknames=server_nicknames,
+            custom_slang=custom_slang
+        )
         if not should_upgrade and result:
             router_result = result
             tlog.info(f"[ROUTING] Router Path -> Success with Fast Model")
         else:
             use_reasoning_model = True
-            target_model = OPENAI_REASONING_MODEL # 맥락 필요 시 gpt-5-mini
+            target_model = OPENAI_REASONING_MODEL # gpt-5-mini
             tlog.info(f"[ROUTING] Router Path -> UPGRADE to {target_model}")
+
 
     # 1차 판단(Router)에서 이미 번역이 완료된 경우 처리
     if router_result:
@@ -415,7 +487,7 @@ async def detect_and_translate(
         
         final_translated = restore_punctuation(router_result["translated"], semantic_mark, emphasis_raw)
         if use_cache:
-            await set_cached(ai_input_text, target_language, router_result["source_lang"], router_result["translated"], user_id=str(user_id))
+            await set_cached(ai_input_text, target_language, router_result["source_lang"], router_result["translated"], context_key=context_key, user_id=str(user_id))
         
         return {
             "source_lang": router_result["source_lang"],
@@ -449,7 +521,7 @@ async def detect_and_translate(
 
     # ── 6. 캐시 저장 ──
     if use_cache:
-        await set_cached(ai_input_text, target_language, source_lang, translated, user_id=str(user_id))
+        await set_cached(ai_input_text, target_language, source_lang, translated, context_key=context_key, user_id=str(user_id))
     return {
         "source_lang": source_lang,
         "translated": final_translated,
@@ -465,17 +537,31 @@ async def translate_image(
     user_id: int = 0,
     nickname: str = "",
     model_override: str = None,
-    instruction: str = None
+    instruction: str = None,
+    server_nicknames: list[str] | None = None
 ) -> dict:
     """
     이미지 내 텍스트를 인식하고 번역.
     """
+    if await check_budget_exceeded():
+        tlog.warning(f"[SECURITY] Vision API blocked due to monthly budget limit.")
+        return {
+            "source_lang": "Unknown",
+            "original_text": "(Budget Exceeded)",
+            "translated": "⚠️ 이번 달 API 사용 예산이 모두 소진되어 이미지 번역 기능을 사용할 수 없습니다.",
+            "model": "BudgetBlocker"
+        }
+
     client = _get_client()
     target_model = model_override or OPENAI_VISION_MODEL
 
     prompt = f"### Task: Extract and translate image text to {target_language}"
     if instruction:
         prompt += f"\n### User Special Instruction: {instruction}"
+    
+    if server_nicknames:
+        prompt += f"\n### [CONTEXT] Known Server Member Nicknames (Proper Nouns): {', '.join(server_nicknames)}"
+        prompt += "\nRule: If these names appear in the image, treat them as proper nouns (Identity) and do NOT translate them unless clearly used as a common noun."
 
     # 추론형 모델(gpt-5) 대응
     is_reasoning = "gpt-5" in target_model

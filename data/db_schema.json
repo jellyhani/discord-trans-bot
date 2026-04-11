@@ -1,0 +1,32 @@
+{
+  "main": {
+    "description": "Primary settings, statistics, and service-specific data (bot.db)",
+    "tables": {
+      "user_personas": "User persona analysis results and mentoring instructions (mentor_instruction)",
+      "user_settings": "User-specific language and auto-translation preferences",
+      "server_settings": "Guild-specific log channels, vision models, and trigger settings",
+      "usage": "User-specific token usage, call counts, and cost statistics",
+      "routines": "User-scheduled periodic tasks (weather, news, etc.)",
+      "custom_slang": "Server-specific custom abbreviations and slang dictionary",
+      "bot_traits": "Bot personality traits (hobby, taste, etc.)",
+      "daily_stats": "Daily global service usage statistics",
+      "cache": "Translation result cache data",
+      "pending_inquiries": "User questions awaiting answers",
+      "developer_knowledge": "Learned knowledge about the developer (jellyfish)",
+      "routine_history": "History of routine executions",
+      "role_lang_map": "Role-to-language mapping for auto-translation",
+      "channel_settings": "Channel-specific auto-translation and language settings",
+      "typo_words": "Word list for typo correction",
+      "abbreviations": "Abbreviation dictionary data",
+      "suspicious_endings": "Sentence ending pattern data"
+    }
+  },
+  "history": {
+    "description": "Large-scale conversation logs and session data (history.db)",
+    "tables": {
+      "chat_logs": "Conversation history from public Discord channels",
+      "mentor_logs": "1:1 or session-based interaction logs between user and mentor bot",
+      "mentor_sessions": "Mentor conversation session metadata (title, active status)"
+    }
+  }
+}

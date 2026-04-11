@@ -24,6 +24,7 @@ from utils.usage_tracker import (
     get_all_user_usage_stats, get_monthly_usage
 )
 from utils.chart_generator import generate_usage_chart, generate_cost_chart, generate_efficiency_chart
+from utils.logger import bot_log
 from config import MONTHLY_COST_LIMIT
 
 
@@ -435,6 +436,37 @@ class AdminCog(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"❌ 새로고침 중 오류 발생: {e}", ephemeral=True)
             bot_log.error(f"[RELOAD-ERROR] {e}")
+
+    @app_commands.command(name="check_persona", description="Check a member's persona and instructions (Admin)")
+    @app_commands.describe(member="Member to check")
+    async def cmd_check_persona(self, interaction: discord.Interaction, member: discord.Member):
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("❌ '서버 관리' 권한이 필요합니다.", ephemeral=True)
+            return
+
+        from database.user_personas import get_user_persona
+        persona = await get_user_persona(member.id)
+        
+        if not persona:
+            await interaction.response.send_message(f"❓ **{member.display_name}**님에 대한 저장된 페르소나 정보가 없습니다.", ephemeral=True)
+            return
+            
+        embed = discord.Embed(title=f"👤 페르소나 정보: {member.display_name}", color=0xF1C40F)
+        embed.set_thumbnail(url=member.display_avatar.url)
+        
+        # Persona Summary (Historical/Last)
+        summary = persona.get("first_persona") or "정보 없음"
+        last = persona.get("last_persona") or "정보 없음"
+        
+        embed.add_field(name="📜 최초 분석 요약", value=summary[:1024], inline=False)
+        if summary != last:
+            embed.add_field(name="🔄 최근 분석 요약", value=last[:1024], inline=False)
+            
+        # Mentor Instructions
+        instruction = persona.get("mentor_instruction") or "설정된 지시사항 없음"
+        embed.add_field(name="💡 멘토 지시사항 (Prompt)", value=instruction[:1024], inline=False)
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @cmd_set_lang.autocomplete("language")
     @cmd_set_channel.autocomplete("target_lang")

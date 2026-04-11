@@ -14,15 +14,17 @@ def _normalize_text(text: str) -> str:
     return s
 
 
-def _make_key(text: str, target_lang: str) -> str:
+def _make_key(text: str, target_lang: str, context_key: str = None) -> str:
     normalized = _normalize_text(text)
     raw = f"{normalized}|{target_lang.strip().lower()}"
+    if context_key:
+        raw += f"|ctx:{context_key}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-async def get_cached(text: str, target_lang: str) -> dict | None:
+async def get_cached(text: str, target_lang: str, context_key: str = None) -> dict | None:
     """캐시된 번역 결과를 가져옵니다."""
-    key = _make_key(text, target_lang)
+    key = _make_key(text, target_lang, context_key)
     db = get_db()
     async with db.execute(
         "SELECT source_lang, translated FROM cache WHERE key = ?", (key,)
@@ -33,9 +35,9 @@ async def get_cached(text: str, target_lang: str) -> dict | None:
         return None
 
 
-async def set_cached(text: str, target_lang: str, source_lang: str, translated: str, user_id: str = None):
+async def set_cached(text: str, target_lang: str, source_lang: str, translated: str, context_key: str = None, user_id: str = None):
     """번역 결과를 캐시에 저장합니다. (유저 ID 포함)"""
-    key = _make_key(text, target_lang)
+    key = _make_key(text, target_lang, context_key)
     db = get_db()
     await db.execute(
         """INSERT OR REPLACE INTO cache (key, original, target_lang, source_lang, translated, user_id)

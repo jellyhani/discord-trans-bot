@@ -1,6 +1,6 @@
 # usage_tracker.py — SQLite 기반 사용량 추적 (호출별 누적)
 
-from config import COST_PER_1M, OPENAI_MODEL_SMART
+from config import COST_PER_1M, OPENAI_MODEL_SMART, MONTHLY_COST_LIMIT
 from database.database import get_db
 from datetime import date
 
@@ -280,3 +280,9 @@ async def get_monthly_usage() -> float:
     """, (f"{this_month}%",)) as cursor:
         row = await cursor.fetchone()
         return row[0] if row and row[0] is not None else 0.0
+
+async def check_budget_exceeded() -> bool:
+    """월 예산이 초과되었는지 확인합니다."""
+    current_cost = await get_monthly_usage()
+    return current_cost >= MONTHLY_COST_LIMIT
+

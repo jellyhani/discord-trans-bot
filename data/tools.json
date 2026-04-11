@@ -1,0 +1,298 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "get_weather",
+      "description": "실시간 날씨 정보를 가져옵니다.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "location": {
+            "type": "string",
+            "description": "지역명 (예: '서울', 'London')"
+          }
+        },
+        "required": ["location"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_finance_data",
+      "description": "주식 가격이나 환율 정보를 가져옵니다.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "symbol": {
+            "type": "string",
+            "description": "심볼 (예: 'AAPL', 'USD/KRW')"
+          }
+        },
+        "required": ["symbol"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "search_web",
+      "description": "웹 검색을 통해 최신 정보를 찾습니다.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "검색어"
+          },
+          "region": {
+            "type": "string",
+            "description": "지역 코드 (기본값: 'wt-wt')",
+            "default": "wt-wt"
+          }
+        },
+        "required": ["query"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "manage_routine",
+      "description": "사용자의 정기 작업(루틴)을 관리합니다. (예: 매일 아침 8시에 날씨 알려줘)",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": ["add", "remove", "list"],
+            "description": "수행할 작업"
+          },
+          "task_type": {
+            "type": "string",
+            "enum": ["search", "weather", "news"],
+            "description": "루틴 종류"
+          },
+          "query": {
+            "type": "string",
+            "description": "검색어 또는 지역명"
+          },
+          "schedule_time": {
+            "type": "string",
+            "description": "시간 (HH:MM) 24시간제"
+          },
+          "routine_id": {
+            "type": "integer",
+            "description": "삭제 시 필요한 루틴 ID"
+          },
+          "destination": {
+            "type": "string",
+            "enum": ["channel", "dm"],
+            "description": "결과 전송 위치",
+            "default": "channel"
+          }
+        },
+        "required": ["action"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "execute_delayed_task",
+      "description": "일정 시간 후 메시지 전송 또는 작업 실행. ('channel' 전송 시에만 관리자 권한 필요). 상대적인 시간(1시간 뒤 등)을 초 단위로 변환하여 입력하세요.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "delay_seconds": {
+            "type": "integer",
+            "description": "지연 시간(초). 예: 1시간=3600"
+          },
+          "content": {
+            "type": "string",
+            "description": "전송할 구체적인 메시지 내용"
+          },
+          "repeat_count": {
+            "type": "integer",
+            "description": "총 반복 횟수 (최대 10회 권장)",
+            "default": 1
+          },
+          "interval_seconds": {
+            "type": "integer",
+            "description": "반복 사이의 간격(초)",
+            "default": 0
+          },
+          "destination": {
+            "type": "string",
+            "enum": ["channel", "dm"],
+            "default": "channel"
+          }
+        },
+        "required": ["delay_seconds", "content"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_user_persona_summary",
+      "description": "사용자의 페르소나 분석 결과 및 특징 요약을 조회합니다. (비용 절감을 위해 요청 시에만 사용)",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "update_system_prompt",
+      "description": "AI 자신의 시스템 지침(프롬프트)을 수정하여 지능이나 성격을 개선합니다. (개발자 전용)",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "category": {
+            "type": "string",
+            "enum": ["translation", "router", "mentor", "persona"],
+            "description": "수정할 프롬프트 카테고리"
+          },
+          "key": {
+            "type": "string",
+            "description": "수정할 프롬프트의 키"
+          },
+          "value": {
+            "type": "string",
+            "description": "새로운 프롬프트 내용"
+          }
+        },
+        "required": ["category", "key", "value"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "inspect_database",
+      "description": "[AUTHORIZED] 데이터베이스를 직접 조회합니다. SELECT 쿼리로 모든 테이블에 접근 가능합니다. 사용자가 기록이나 통계를 물으면 반드시 이 도구를 사용하세요.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": ["list_tables", "query"],
+            "description": "수행할 작업"
+          },
+          "sql": {
+            "type": "string",
+            "description": "실행할 SELECT SQL 문"
+          },
+          "db_type": {
+            "type": "string",
+            "enum": ["main", "history"],
+            "description": "조회할 DB 종류"
+          }
+        },
+        "required": ["action"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "manage_dictionary",
+      "description": "서버 전용 커스텀 줄임말/슬랭 사전을 관리합니다.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": ["add", "remove", "list"],
+            "description": "수행할 작업"
+          },
+          "short_form": {
+            "type": "string",
+            "description": "줄임말/슬랭"
+          },
+          "full_meaning": {
+            "type": "string",
+            "description": "실제 의미"
+          }
+        },
+        "required": ["action"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "set_my_persona",
+      "description": "유저 자신의 페르소나 분석 스타일이나 아바타 생성 지침을 구성합니다.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "instruction": {
+            "type": "string",
+            "description": "AI에게 내릴 지침"
+          }
+        },
+        "required": ["instruction"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_discord_profile",
+      "description": "디스코드 유저의 상세 프로필을 조회합니다. 자기소개(About Me), 연동 계정 정보를 확인합니다. 유저가 '내 정보가 뭐예요?'나 '나에 대해 알려줘'라고 물을 때 페르소나 요약과 함께 반드시 이 도구를 사용하여 공식 데이터를 확인하십시오.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "description": "조회할 디스코드 유저의 ID (숫자)"
+          },
+          "force_refresh": {
+            "type": "boolean",
+            "description": "True로 설정하면 캐시를 무시하고 새로 조회합니다. 데이터가 최신이 아닐 때 사용하세요.",
+            "default": false
+          }
+        },
+        "required": ["user_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_steam_profile",
+      "description": "Steam 유저의 공개 프로필을 조회합니다. [주의] 결과 출력 시 반드시 'https://steamcommunity.com/profiles/[숫자]/' 형식을 사용하십시오.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Steam 프로필 URL, Vanity ID, 또는 SteamID64 (예: 'https://steamcommunity.com/id/username', 'username', '76561198xxxxxxxxx')"
+          }
+        },
+        "required": ["query"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_vrc_profile",
+      "description": "VRChat 유저의 공개 프로필 정보를 조회합니다.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "username": {
+            "type": "string",
+            "description": "VRChat 유저 이름"
+          }
+        },
+        "required": ["username"]
+      }
+    }
+  }
+]

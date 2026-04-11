@@ -8,6 +8,7 @@ from datetime import datetime
 
 from config import FLAG_TO_LANG, CONTEXT_MESSAGE_COUNT, LOG_LEVELS, LOG_BUFFER_INTERVAL, VISION_TRIGGER_PREFIX, OPENAI_VISION_MODEL
 from core.translator import detect_and_translate, translate_image
+from core.prompt_manager import prompt_manager
 from database.user_settings import (
     get_user_lang, get_auto_translate, get_log_channel_id, get_log_level,
     get_ignored_channels, get_channel_config, get_role_lang, set_user_pref,
@@ -131,17 +132,26 @@ class EventsCog(commands.Cog):
         """서버 멤버들의 닉네임을 수집하여 리스트로 반환."""
         if not guild:
             return []
-        
-        # 100명 이하 소규모 서버는 전체, 대규모 서버는 최근 활동 멤버 위주(캐시된 멤버)
-        # discord.py's guild.members is usually enough if intents.members is on
         nicknames = []
         for member in guild.members:
             if member.bot:
                 continue
             nicknames.append(member.display_name)
-            if len(nicknames) >= 150: # 토큰 절약을 위한 최대 제한
+            if len(nicknames) >= 150:
                 break
         return nicknames
+
+    def _clean_tags(self, text: str) -> str:
+        """구조적 마커를 시각적으로 미려한 이모지와 굵은 글씨로 변환."""
+        # 💬 메시지 본문
+        text = re.sub(r"\[MSG\]\s*", "💬 **Message**\n", text)
+        # 📍 임베드 제목/설명
+        text = re.sub(r"\[TITLE\]\s*", "\n\n📍 **Title**\n", text)
+        text = re.sub(r"\[DESC\]\s*", "\n📝 **Description**\n", text)
+        # 🔹 필드
+        text = re.sub(r"\[FIELD_NAME\]\s*", "\n🔹 ", text)
+        text = re.sub(r"\[FIELD_VALUE\]\s*", "\n   └ ", text)
+        return text.strip()
 
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
@@ -276,7 +286,13 @@ class EventsCog(commands.Cog):
 
         embed = discord.Embed(description=result["translated"], color=discord.Color.blue())
         embed.set_footer(text=footer)
-        reply_msg = await message.reply(embed=embed, mention_author=False)
+        try:
+            reply_msg = await message.reply(embed=embed, mention_author=False)
+        except discord.HTTPException as e:
+            if e.code == 50035:  # Unknown message (원본 삭제됨)
+                self._log_event("SKIP-DELETED", message.author, "original message deleted during translation")
+                return None
+            raise
 
         # ── 캐시 저장 (삭제 연동용) ──
         self.translation_replies[message.id] = {
@@ -309,10 +325,12 @@ class EventsCog(commands.Cog):
             self._log_event("VISION-START", message.author, f"attachment={attachment.filename}", f"instruction='{instruction}'" if instruction else "")
             
             try:
+                server_nicknames = self._get_guild_nicknames(message.guild) if message.guild else []
                 result = await translate_image(
                     attachment.url, target_lang,
                     user_id=message.author.id, nickname=message.author.display_name,
-                    model_override=model, instruction=instruction
+                    model_override=model, instruction=instruction,
+                    server_nicknames=server_nicknames
                 )
                 
                 embed = discord.Embed(color=0xA2C2E1) # 밝은 파랑
@@ -320,7 +338,13 @@ class EventsCog(commands.Cog):
                 embed.add_field(name=f"🌐 번역 ({target_lang})", value=result["translated"][:1000], inline=False)
                 embed.set_footer(text=f"Vision · {result['model']}")
                 
-                reply_msg = await message.reply(embed=embed, mention_author=False)
+                try:
+                    reply_msg = await message.reply(embed=embed, mention_author=False)
+                except discord.HTTPException as e:
+                    if e.code == 50035:  # Unknown message (원본 삭제됨)
+                        self._log_event("SKIP-DELETED", message.author, "original message deleted during vision translation")
+                        return
+                    raise
                 self._log_event("VISION-DONE", message.author, "success")
                 
                 # ── 캐시 저장 (삭제 연동용) ──
@@ -450,6 +474,28 @@ class EventsCog(commands.Cog):
             except:
                 pass
 
+    # ── 공통 재번역 헬퍼 ──
+    async def _retranslate(self, text: str, target_lang: str, channel, original_msg_id: int, user_id: int, nickname: str):
+        """수정/재번역에서 공통으로 사용하는 구조적 번역 로직."""
+        context_messages = await self._fetch_context(channel, await channel.fetch_message(original_msg_id), CONTEXT_MESSAGE_COUNT)
+        server_nicknames = self._get_guild_nicknames(channel.guild) if channel.guild else []
+
+        instruction = (
+            f"Translate the content into {target_lang}. "
+            "### CRITICAL RULE:\n"
+            "1. Keep the marker [MSG] EXACTLY AS IT IS.\n"
+            "2. Provide the translation IMMEDIATELY after the marker."
+        )
+
+        result = await detect_and_translate(
+            f"[MSG] {text}", target_lang,
+            user_id=user_id, nickname=nickname,
+            use_cache=False, context_messages=context_messages,
+            server_nicknames=server_nicknames,
+            instruction=instruction
+        )
+        return result
+
     @commands.Cog.listener()
     async def on_message_edit(self, before: discord.Message, after: discord.Message):
         if after.author.bot:
@@ -466,33 +512,37 @@ class EventsCog(commands.Cog):
         target_lang = get_user_lang(user_id)
 
         try:
-            context_messages = await self._fetch_context(after.channel, after, CONTEXT_MESSAGE_COUNT)
-            server_nicknames = self._get_guild_nicknames(after.guild) if after.guild else []
-            result = await detect_and_translate(
-                content, target_lang, user_id=user_id, nickname=after.author.display_name,
-                use_cache=False, context_messages=context_messages,
-                server_nicknames=server_nicknames
-            )
+            result = await self._retranslate(content, target_lang, after.channel, after.id, user_id, after.author.display_name)
 
             if result["source_lang"].lower() == target_lang.lower():
                 return
 
+            clean_result = self._clean_tags(result["translated"])
             correction_tag = " · ✏️교정됨" if result.get("was_correction") else ""
             footer = f"🌐 {result['source_lang']} → {target_lang}{correction_tag} · 수정됨"
-            embed = discord.Embed(description=result["translated"], color=discord.Color.blue())
+            embed = discord.Embed(description=clean_result, color=discord.Color.blue())
             embed.set_footer(text=footer)
 
+            # 1. 메모리 캐시 확인
             info = self.translation_replies.get(after.id)
+            reply_msg = None
             if info:
                 try:
                     ch = self.bot.get_channel(info["channel_id"]) or await self.bot.fetch_channel(info["channel_id"])
                     reply_msg = await ch.fetch_message(info["reply_id"])
-                    await reply_msg.edit(embed=embed)
-                    self._log_event("EDIT-UPDATE", after.author, content[:20])
-                    return
                 except discord.NotFound:
                     pass
+            
+            # 2. 역추적 폴백 (캐시 없거나 삭제된 경우)
+            if not reply_msg:
+                reply_msg = await self._find_bot_reply(after.channel, after.id)
 
+            if reply_msg:
+                await reply_msg.edit(embed=embed)
+                self._log_event("EDIT-UPDATE", after.author, content[:20])
+                return
+
+            # 새로 보내기
             reply_msg = await after.reply(embed=embed, mention_author=False)
             self.translation_replies[after.id] = {
                 "reply_id": reply_msg.id, "channel_id": after.channel.id,
@@ -533,6 +583,9 @@ class EventsCog(commands.Cog):
         except Exception as e:
             self._log_event("AUTO-DEL-TRACE-FAIL", "System", str(e))
 
+    # ──────────────────────────────────────────
+    # 리액션 이벤트 (디스패치 라우터)
+    # ──────────────────────────────────────────
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
         if payload.user_id == self.bot.user.id:
@@ -547,132 +600,184 @@ class EventsCog(commands.Cog):
         emoji_str = str(payload.emoji)
         self._log_event("REACT-RAW", payload.user_id, f"emoji='{emoji_str}' hex={[hex(ord(c)) for c in emoji_str]}")
 
-        # ── 🔄 재번역 ──
         if emoji_str == "🔄":
-            if self._is_duplicate(f"refresh:{payload.message_id}:{payload.user_id}"):
-                return
-
-            try:
-                ch = self.bot.get_channel(payload.channel_id) or await self.bot.fetch_channel(payload.channel_id)
-                bot_reply_msg = await ch.fetch_message(payload.message_id)
-
-                if bot_reply_msg.author.id != self.bot.user.id:
-                    return
-
-                user = payload.member or await self.bot.fetch_user(payload.user_id)
-                info = self.reply_to_original.get(payload.message_id)
-
-                if not info:
-                    if not bot_reply_msg.reference or not bot_reply_msg.reference.message_id:
-                        return
-                    original_msg_id = bot_reply_msg.reference.message_id
-                    try:
-                        original_msg = await ch.fetch_message(original_msg_id)
-                    except discord.NotFound:
-                        return
-                    if not original_msg.content or not original_msg.content.strip():
-                        return
-                    target_lang = get_user_lang(payload.user_id)
-                    info = {
-                        "original_text": original_msg.content.strip(), "target_lang": target_lang,
-                        "channel_id": ch.id, "original_msg_id": original_msg_id,
-                    }
-
-                context_messages = await self._fetch_context(ch, await ch.fetch_message(info["original_msg_id"]), CONTEXT_MESSAGE_COUNT)
-                server_nicknames = self._get_guild_nicknames(ch.guild) if ch.guild else []
-                result = await detect_and_translate(
-                    info["original_text"], info["target_lang"],
-                    user_id=payload.user_id, nickname=user.display_name,
-                    use_cache=False, context_messages=context_messages,
-                    server_nicknames=server_nicknames
-                )
-
-                if result["source_lang"].lower() == info["target_lang"].lower():
-                    return
-
-                correction_tag = " · ✏️교정됨" if result.get("was_correction") else ""
-                footer = f"🌐 {result['source_lang']} → {info['target_lang']}{correction_tag} · 🔄재번역"
-                embed = discord.Embed(description=result["translated"], color=discord.Color.green())
-                embed.set_footer(text=footer)
-                await bot_reply_msg.edit(embed=embed)
-
-                self.reply_to_original[payload.message_id] = info
-                self._log_event("REFRESH", user, info["original_text"][:20])
-            except Exception as e:
-                self._log_event("REFRESH-ERR", "System", str(e))
-            return
-
-        # ── 📛 히라가나 위주 일본어 번역 ──
+            return await self._handle_refresh_reaction(payload)
         if emoji_str == "📛":
-            if self._is_duplicate(f"hiragana:{payload.message_id}:{payload.user_id}"):
+            return await self._handle_hiragana_reaction(payload)
+
+        target_lang = _match_flag_lang(emoji_str)
+        if target_lang:
+            return await self._handle_flag_reaction(payload, target_lang)
+
+    # ── 🔄 재번역 핸들러 ──
+    async def _handle_refresh_reaction(self, payload):
+        if self._is_duplicate(f"refresh:{payload.message_id}:{payload.user_id}"):
+            return
+
+        try:
+            ch = self.bot.get_channel(payload.channel_id) or await self.bot.fetch_channel(payload.channel_id)
+            bot_reply_msg = await ch.fetch_message(payload.message_id)
+
+            if bot_reply_msg.author.id != self.bot.user.id:
                 return
 
-            try:
-                channel = self.bot.get_channel(payload.channel_id) or await self.bot.fetch_channel(payload.channel_id)
-                message = await channel.fetch_message(payload.message_id)
-                if not message.content or _should_skip_translation(message.content):
+            user = payload.member or await self.bot.fetch_user(payload.user_id)
+            info = self.reply_to_original.get(payload.message_id)
+
+            if not info:
+                if not bot_reply_msg.reference or not bot_reply_msg.reference.message_id:
                     return
+                original_msg_id = bot_reply_msg.reference.message_id
+                try:
+                    original_msg = await ch.fetch_message(original_msg_id)
+                except discord.NotFound:
+                    return
+                if not original_msg.content or not original_msg.content.strip():
+                    return
+                target_lang = get_user_lang(payload.user_id)
+                info = {
+                    "original_text": original_msg.content.strip(), "target_lang": target_lang,
+                    "channel_id": ch.id, "original_msg_id": original_msg_id,
+                }
 
-                user = payload.member or await self.bot.fetch_user(payload.user_id)
-                self._log_event("REACT-HIRAGANA", user, message.content[:20])
+            result = await self._retranslate(info["original_text"], info["target_lang"], ch, info["original_msg_id"], payload.user_id, user.display_name)
 
-                context_messages = await self._fetch_context(channel, message, CONTEXT_MESSAGE_COUNT)
-                server_nicknames = self._get_guild_nicknames(channel.guild) if channel.guild else []
-                result = await detect_and_translate(
-                    message.content, "Japanese",
-                    user_id=payload.user_id, nickname=user.display_name,
-                    use_cache=False, context_messages=context_messages,
-                    instruction="RULE: TRANSLATE NATURALLY TO JAPANESE BUT USE ONLY HIRAGANA. NO KANJI AT ALL. (Katakana is allowed for loanwords). ZERO KANJI TOLERANCE. NO EXCESSIVE PARAPHRASING.",
-                    server_nicknames=server_nicknames
-                )
+            if result["source_lang"].lower() == info["target_lang"].lower():
+                return
 
-                embed = discord.Embed(color=0xF1C40F) # 노란색 (아이/초보 이미지)
-                embed.add_field(name=f"📝 Original Text ({result['source_lang']})", value=message.content[:1000], inline=False)
-                embed.add_field(name=f"🌐 Japanese (Hiragana)", value=result["translated"][:1000], inline=False)
-                embed.set_footer(
-                    text=f"Requested by: {user.display_name} | 📛 Hiragana Mode",
-                    icon_url=user.display_avatar.url if user.display_avatar else None,
-                )
-                await channel.send(embed=embed)
-            except Exception as e:
-                bot_log.error(f"Hiragana Reaction Error: {e}")
-            return
+            clean_result = self._clean_tags(result["translated"])
+            correction_tag = " · ✏️교정됨" if result.get("was_correction") else ""
+            footer = f"🌐 {result['source_lang']} → {info['target_lang']}{correction_tag} · 🔄재번역"
+            embed = discord.Embed(description=clean_result, color=discord.Color.green())
+            embed.set_footer(text=footer)
+            await bot_reply_msg.edit(embed=embed)
 
-        # ── 국기 리액션 번역 ──
-        target_lang = _match_flag_lang(emoji_str)
-        if not target_lang:
-            return
+            self.reply_to_original[payload.message_id] = info
+            self._log_event("REFRESH", user, info["original_text"][:20])
+        except Exception as e:
+            self._log_event("REFRESH-ERR", "System", str(e))
 
-        if self._is_duplicate(f"react:{payload.message_id}:{emoji_str}:{payload.user_id}"):
+    # ── 📛 히라가나 핸들러 ──
+    async def _handle_hiragana_reaction(self, payload):
+        if self._is_duplicate(f"hiragana:{payload.message_id}:{payload.user_id}"):
             return
 
         try:
             channel = self.bot.get_channel(payload.channel_id) or await self.bot.fetch_channel(payload.channel_id)
+
+            # 권한 체크 (API 호출 전 조기 반환)
+            perms = channel.permissions_for(channel.guild.me)
+            if not perms.send_messages or not perms.embed_links:
+                bot_log.debug(f"Hiragana: Missing permissions in channel {channel.id}, skipping")
+                return
+
             message = await channel.fetch_message(payload.message_id)
             if not message.content or _should_skip_translation(message.content):
                 return
 
             user = payload.member or await self.bot.fetch_user(payload.user_id)
-            self._log_event("REACT", user, message.content[:20], f"→ {target_lang}")
+            self._log_event("REACT-HIRAGANA", user, message.content[:20])
 
             context_messages = await self._fetch_context(channel, message, CONTEXT_MESSAGE_COUNT)
             server_nicknames = self._get_guild_nicknames(channel.guild) if channel.guild else []
             result = await detect_and_translate(
-                message.content, target_lang,
+                message.content, "Japanese",
+                user_id=payload.user_id, nickname=user.display_name,
+                use_cache=False, context_messages=context_messages,
+                instruction="""[STRICT RULE] Japanese Hiragana Mode:
+1. Translate or Convert the input into Japanese using ONLY Hiragana (ひらがな).
+2. **ZERO KANJI POLICY**: NEVER use Kanji (漢字). All Kanji MUST be converted to their Hiragana readings.
+3. Katakana (カタカナ) is ONLY allowed for foreign loanwords or names.
+4. **Correct Example**: '오늘은 날씨가 좋네요' -> 'きょうは　てんきが　いいですね' (O)
+5. **No Mixed Script**: Do NOT provide Kanji in parentheses. Use Hiragana ONLY.
+6. **No Spacing**: Do NOT use spaces between words (No Wakachigaki). Maintain a continuous string like natural Japanese.
+7. **Integrity**: Ensure the entire message is translated/converted without missing parts.""",
+                server_nicknames=server_nicknames
+            )
+
+            embed = discord.Embed(color=0xF1C40F)
+            embed.add_field(name=f"📝 Original Text ({result['source_lang']})", value=message.content[:1000], inline=False)
+            embed.add_field(name=f"🌐 Japanese (Hiragana)", value=result["translated"][:1000], inline=False)
+            embed.set_footer(
+                text=f"Requested by: {user.display_name} | 📛 Hiragana Mode",
+                icon_url=user.display_avatar.url if user.display_avatar else None,
+            )
+            await channel.send(embed=embed)
+        except Exception as e:
+            bot_log.error(f"Hiragana Reaction Error: {e}")
+
+    # ── 🏳 국기 리액션 핸들러 ──
+    async def _handle_flag_reaction(self, payload, target_lang: str):
+        if self._is_duplicate(f"react:{payload.message_id}:{str(payload.emoji)}:{payload.user_id}"):
+            return
+
+        try:
+            channel = self.bot.get_channel(payload.channel_id) or await self.bot.fetch_channel(payload.channel_id)
+
+            # 권한 체크 (API 호출 전 조기 반환)
+            perms = channel.permissions_for(channel.guild.me)
+            if not perms.send_messages or not perms.embed_links:
+                bot_log.debug(f"Flag Reaction: Missing permissions in channel {channel.id}, skipping")
+                return
+
+            message = await channel.fetch_message(payload.message_id)
+            
+            # 1. 번역할 모든 텍스트 수집 (메시지 본문 + 모든 임베드)
+            content = message.content.strip() if message.content else ""
+            collected_segments = []
+            
+            if content:
+                collected_segments.append(f"[MSG] {content}")
+                
+            if message.embeds:
+                for idx, emb in enumerate(message.embeds):
+                    if emb.title: collected_segments.append(f"[TITLE] {emb.title}")
+                    if emb.description: collected_segments.append(f"[DESC] {emb.description}")
+                    for f_idx, field in enumerate(emb.fields):
+                        collected_segments.append(f"[FIELD_NAME] {field.name}")
+                        collected_segments.append(f"[FIELD_VALUE] {field.value}")
+            
+            if not collected_segments:
+                return
+
+            user = payload.member or await self.bot.fetch_user(payload.user_id)
+            source_for_log = collected_segments[0][:30]
+            self._log_event("REACT", user, source_for_log, f"→ {target_lang}")
+
+            # 2. AI에게 구조화된 번역 요청
+            full_raw_text = "\n".join(collected_segments)
+            context_messages = await self._fetch_context(channel, message, CONTEXT_MESSAGE_COUNT)
+            server_nicknames = self._get_guild_nicknames(channel.guild) if channel.guild else []
+            
+            instruction = (
+                f"Translate the content of each block into {target_lang}. "
+                "### CRITICAL RULE:\n"
+                "1. Keep the markers ([MSG], [TITLE], [DESC], [FIELD_NAME], [FIELD_VALUE]) EXACTLY AS THEY ARE.\n"
+                "2. DO NOT omit, translate, or merge any markers.\n"
+                "3. Provide the translation IMMEDIATELY after each marker on the same line."
+            )
+
+            result = await detect_and_translate(
+                full_raw_text, target_lang,
                 user_id=payload.user_id, nickname=user.display_name,
                 use_cache=True, context_messages=context_messages,
-                server_nicknames=server_nicknames
+                server_nicknames=server_nicknames,
+                instruction=instruction
             )
 
             if result.get("cache_hit"):
                 await record_cache_hit(payload.user_id, user.display_name)
 
+            # 3. 번역 결과 가공
+            clean_result = self._clean_tags(result["translated"])
+
             cache_tag = " · 📦캐시" if result.get("cache_hit") else ""
-            embed = discord.Embed(color=0x5865F2)
-            embed.add_field(name=f"📝 원문 ({result['source_lang']})", value=message.content[:1000], inline=False)
-            embed.add_field(name=f"🌐 번역 ({target_lang})", value=result["translated"][:1000], inline=False)
+            embed = discord.Embed(
+                description=clean_result.strip(), 
+                color=0x5865F2
+            )
             embed.set_footer(
-                text=f"요청: {user.display_name}{cache_tag}",
+                text=f"요청: {user.display_name} | {result['source_lang']}→{target_lang}{cache_tag}",
                 icon_url=user.display_avatar.url if user.display_avatar else None,
             )
             await channel.send(embed=embed)
@@ -680,7 +785,7 @@ class EventsCog(commands.Cog):
             if payload.guild_id:
                 await self._send_log(
                     payload.guild_id, 3,
-                    f"[리액션 번역] {user.display_name} | {result['source_lang']}→{target_lang} | \"{message.content}\"",
+                    f"[리액션 번역] {user.display_name} | {result['source_lang']}→{target_lang} | {source_for_log}",
                 )
         except Exception as e:
             bot_log.error(f"Reaction Error: {e}")
