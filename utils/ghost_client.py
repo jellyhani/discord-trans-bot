@@ -21,15 +21,6 @@ _HEADERS = {
     "X-Discord-Locale": "ko",
     "X-Discord-Timezone": "Asia/Seoul",
     "X-Super-Properties": (
-        "eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiRmlyZWZveCIsImRldmljZSI6IiIs"
-        "InN5c3RlbV9sb2NhbGUiOiJrby1LUiIsImhhc19jbGllbnRfbW9kcyI6ZmFsc2Us"
-        "ImJyb3dzZXJfdXNlcl9hZ2VudCI6Ik1vemlsbGEvNS4wIChXaW5kb3dzIE5UIDEw"
-        "LjA7IFdpbjY0OyB4NjQ7IHJ2OjE0OS4wKSBHZWNrby8yMDEwMDEwMSBGaXJlZm94"
-        "LzE0OS4wIiwiYnJvd3Nlcl92ZXJzaW9uIjoiMTQ5LjAiLCJvc192ZXJzaW9uIjoi"
-        "MTAiLCJyZWZlcnJlciI6IiIsInJlZmVycmluZ19kb21haW4iOiIiLCJyZWZlcnJl"
-        "cl9jdXJyZW50IjoiIiwicmVmZXJyaW5nX2RvbWFpbl9jdXJyZW50IjoiIiwicmVs"
-        "ZWFzZV9jaGFubmVsIjoic3RhYmxlIiwiY2xpZW50X2J1aWxkX251bWJlciI6NTIz"
-        "MDYxLCJjbGllbnRfZXZlbnRfc291cmNlIjpudWxsfQ=="
     ),
 }
 
